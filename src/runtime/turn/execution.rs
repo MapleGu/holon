@@ -54,7 +54,7 @@ use super::context_management::{
 };
 use super::projection::{
     build_round_estimated_tokens, build_turn_local_projection_with_time,
-    estimate_prompt_blocks_tokens, estimate_prompt_frame_tokens, estimate_round_tokens,
+    estimate_prompt_blocks_tokens, estimate_prompt_frame_tokens, estimate_projection_tokens, estimate_round_tokens,
     estimate_tool_specs_tokens, normalize_provider_attempt_timing, provider_attempt_model_state,
     TurnLocalProjectionOutcome,
 };
@@ -2787,6 +2787,8 @@ impl RuntimeHandle {
                     "fallback_active": model_attempt_state.fallback_active,
                     "context_management": context_management,
                     "turn_local_compaction": turn_local_compaction,
+                    "chat_compaction": chat_remote_compaction(
+                        request_diagnostics.as_ref(), run_id.as_deref(), runtime.inner.identity_incarnation),
                     "provider_request_diagnostics": request_diagnostics.clone(),
                     "provider_attempt_timeline": attempt_timeline,
                 }),
@@ -4801,6 +4803,8 @@ impl<'a> TurnExecution<'a> {
                 &material,
             )?
         };
+        let mut observed_request_model = model_selection.fallback_model().cloned()
+            .unwrap_or_else(|| turn_model.model.effective_model.clone());
         let time_timezone = runtime.current_time_timezone().await?;
         let (
             mut provider,
@@ -5082,6 +5086,25 @@ impl<'a> TurnExecution<'a> {
                             ))
                         })
                         .await?;
+                    // Downstream read-only telemetry: reuse the native projection estimator.
+                    // This is the prepared request, not provider billing or cache occupancy.
+                    let observed_run_id = { runtime.inner.agent.lock().await.state.current_run_id.clone() };
+                    runtime.append_original_audit_event(AuditEvent::legacy(
+                        "chat_context_observed",
+                        serde_json::json!({
+                            "agent_id": agent_id,
+                            "incarnation": runtime.inner.identity_incarnation,
+                            "run_id": observed_run_id,
+                            "round": round,
+                            "model": &observed_request_model,
+                            "requested_model": &turn_model.model.effective_model,
+                            "estimated_tokens": estimate_projection_tokens(&request.prompt_frame, &request.conversation)
+                                .saturating_add(estimate_tool_specs_tokens(&request.tools)),
+                            "context_window_tokens": turn_model.model.resolved_policy.context_window_tokens,
+                            "prompt_budget_estimated_tokens": turn_model.model.resolved_policy.prompt_budget_estimated_tokens,
+                            "compaction_trigger_estimated_tokens": turn_model.model.resolved_policy.compaction_trigger_estimated_tokens,
+                        }),
+                    )).await?;
                     let (result, provider_started_at, provider_completed_at, provider_round_ms) =
                         Box::pin(runtime.complete_turn_with_cooling_recovery(
                             provider.clone(), request,
@@ -5100,6 +5123,7 @@ impl<'a> TurnExecution<'a> {
                             continue 'provider_round;
                         }
                         ProviderRoundDispatch::Reselect(model, timeline) => {
+                            observed_request_model = model.clone();
                             reselected_attempts = timeline;
                             runtime.reconfigure_provider_for_turn(Some(&model)).await?;
                             (provider, available_tools, _, native_web_search, _) = runtime
@@ -5486,12 +5510,15 @@ impl<'a> TurnExecution<'a> {
                                     base_round: compaction.checkpoint_base_round,
                                     text_fragments: Vec::new(),
                                 });
+                                let checkpoint_run_id = { runtime.inner.agent.lock().await.state.current_run_id.clone() };
                                 runtime.append_original_audit_event(AuditEvent::legacy(
                                     "turn_local_checkpoint_requested",
                                     serde_json::json!({
                                         "agent_id": agent_id,
                                         "round": round,
                                         "checkpoint_request_id": request_id,
+                                        "run_id": checkpoint_run_id,
+                                        "incarnation": runtime.inner.identity_incarnation,
                                         "checkpoint_mode": mode.as_str(),
                                         "checkpoint_anchor_generation": anchor_generation,
                                         "checkpoint_base_round": compaction.checkpoint_base_round,
@@ -5573,6 +5600,25 @@ impl<'a> TurnExecution<'a> {
                             return Ok(ProviderRoundResult::Terminal(outcome));
                         }
                     };
+                    // Downstream read-only telemetry: reuse the native projection estimator.
+                    // This is the prepared request, not provider billing or cache occupancy.
+                    let observed_run_id = { runtime.inner.agent.lock().await.state.current_run_id.clone() };
+                    runtime.append_original_audit_event(AuditEvent::legacy(
+                        "chat_context_observed",
+                        serde_json::json!({
+                            "agent_id": agent_id,
+                            "incarnation": runtime.inner.identity_incarnation,
+                            "run_id": observed_run_id,
+                            "round": round,
+                            "model": &observed_request_model,
+                            "requested_model": &turn_model.model.effective_model,
+                            "estimated_tokens": estimate_projection_tokens(&request.prompt_frame, &request.conversation)
+                                .saturating_add(estimate_tool_specs_tokens(&request.tools)),
+                            "context_window_tokens": turn_model.model.resolved_policy.context_window_tokens,
+                            "prompt_budget_estimated_tokens": turn_model.model.resolved_policy.prompt_budget_estimated_tokens,
+                            "compaction_trigger_estimated_tokens": turn_model.model.resolved_policy.compaction_trigger_estimated_tokens,
+                        }),
+                    )).await?;
                     let (result, provider_started_at, provider_completed_at, provider_round_ms) =
                         Box::pin(runtime.complete_turn_with_cooling_recovery(
                             provider.clone(), request,
@@ -5591,6 +5637,7 @@ impl<'a> TurnExecution<'a> {
                             continue 'provider_round;
                         }
                         ProviderRoundDispatch::Reselect(model, timeline) => {
+                            observed_request_model = model.clone();
                             reselected_attempts = timeline;
                             runtime.reconfigure_provider_for_turn(Some(&model)).await?;
                             (provider, available_tools, _, native_web_search, _) = runtime
@@ -6241,5 +6288,44 @@ mod tests {
         assert!(!provider_error_is_safe_for_context_recovery(&anyhow!(
             "context_length_exceeded"
         )));
+    }
+}
+
+// A deliberately narrow public observation, never the provider diagnostics object.
+fn chat_remote_compaction(
+    diagnostics: Option<&crate::provider::ProviderRequestDiagnostics>,
+    run_id: Option<&str>,
+    incarnation: u64,
+) -> Option<serde_json::Value> {
+    let status = diagnostics?.openai_remote_compaction.as_ref()?.status.as_str();
+    let state = match status {
+        "compacted" => "succeeded",
+        "failed" | "rejected_empty_output" | "rejected_missing_compaction_item"
+        | "invalid_non_persisted_item_id" => "failed",
+        _ => return None,
+    };
+    Some(serde_json::json!({"state": state, "kind": "remote", "run_id": run_id, "incarnation": incarnation}))
+}
+
+#[cfg(test)]
+mod chat_runtime_observation_tests {
+    use super::*;
+    #[test]
+    fn remote_compaction_only_exports_verified_terminal_states() {
+        for (status, expected) in [("compacted", Some("succeeded")), ("failed", Some("failed")),
+            ("rejected_empty_output", Some("failed")), ("rejected_missing_compaction_item", Some("failed")),
+            ("invalid_non_persisted_item_id", Some("failed")), ("skipped_below_threshold", None), ("future", None)] {
+            let diagnostics: crate::provider::ProviderRequestDiagnostics = serde_json::from_value(serde_json::json!({
+                "request_lowering_mode": "full",
+                "openai_remote_compaction": {"status": status, "error": "SECRET", "endpoint_kind": "PRIVATE", "encrypted_content_hashes": ["SECRET"]}
+            })).unwrap();
+            let result = chat_remote_compaction(Some(&diagnostics), Some("run-1"), 7);
+            assert_eq!(result.as_ref().and_then(|v| v["state"].as_str()), expected);
+            if let Some(result) = result {
+                assert_eq!(result.as_object().unwrap().len(), 4);
+                assert_eq!(result["incarnation"], 7);
+                assert!(!result.to_string().contains("SECRET"));
+            }
+        }
     }
 }

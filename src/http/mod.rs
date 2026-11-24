@@ -117,6 +117,8 @@ mod projection_gate;
 mod skills;
 mod state;
 mod tasks;
+mod managed_timers;
+mod operator_prompt_receipts;
 mod templates;
 mod types;
 mod unread;
@@ -641,6 +643,13 @@ pub fn router(state: AppState) -> Router {
             "/agents/{agent_id}/worktree-summary",
             get(state::worktree_summary),
         )
+        .route("/control/agents/{agent_id}/prompt-receipt", get(operator_prompt_receipts::get))
+        .route("/control/timers/preview", post(managed_timers::preview))
+        .route("/control/agents/{agent_id}/managed-timers", get(managed_timers::list).post(managed_timers::create))
+        .route("/control/agents/{agent_id}/managed-timers/{timer_id}", get(managed_timers::get))
+        .route("/control/agents/{agent_id}/managed-timers/{timer_id}/cancel", post(managed_timers::cancel))
+        .route("/control/agents/{agent_id}/managed-timer-deliveries", get(managed_timers::pending))
+        .route("/control/agents/{agent_id}/managed-timer-deliveries/{delivery_id}/ack", post(managed_timers::ack))
         .route("/agents/{agent_id}/timers", get(tasks::timers))
         .route("/agents/{agent_id}/timers/{timer_id}", get(tasks::timer))
         .route(

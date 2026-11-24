@@ -155,6 +155,7 @@ mod test_util;
 mod turn;
 mod unsettled_claim;
 mod waiting;
+mod managed_timers;
 mod wake_matching;
 mod work_reads;
 pub use work_reads::OwnedWorkItemsRead;

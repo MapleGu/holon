@@ -1234,9 +1234,9 @@ pub async fn create_agent(
             None,
             request.name.as_deref(),
             crate::host::AgentBootstrapExecution::Background,
-            // User-initiated creation without an initial_message field:
-            // request the default bootstrap initialization turn (#2795).
-            true,
+            // Keep the historical initialization turn unless this creation explicitly opts out.
+            // Template, identity, model and runtime bootstrap still use the same durable funnel.
+            request.default_initial_message.unwrap_or(true),
         )
         .await
         .map_err(error_response)?;

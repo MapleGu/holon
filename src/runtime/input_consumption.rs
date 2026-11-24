@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 pub(in crate::runtime) mod read;
 
 pub(crate) const INPUT_BATCH_ITEMS: usize = 8;
-pub(crate) const INPUT_BATCH_BYTES: usize = 24 * 1024;
+pub(crate) const INPUT_BATCH_BYTES: usize = 32 * 1024;
 pub(crate) const INPUT_BATCH_SCAN: usize = 64;
 #[cfg(test)]
 const OVERSIZE_PREVIEW_BYTES: usize = 4096;

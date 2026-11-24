@@ -31,6 +31,7 @@ mod selector_budget_tests;
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub(crate) enum PreparedTimerTransition {
+    Managed { command: Box<crate::runtime_db::managed_timers::ManagedMutation>, #[serde(skip)] fault: Option<TransitionFaultPoint> },
     Create {
         record: crate::types::TimerRecord,
         #[serde(skip)]
@@ -52,6 +53,7 @@ pub(crate) enum PreparedTimerTransition {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TimerMutationOutcome {
+    Managed { record: crate::types::TimerRecord },
     Created {
         record: crate::types::TimerRecord,
     },
@@ -63,6 +65,7 @@ pub(crate) enum TimerMutationOutcome {
     },
 }
 impl PreparedTimerTransition {
+    pub(crate) fn managed(command: crate::runtime_db::managed_timers::ManagedMutation, fault: Option<TransitionFaultPoint>) -> Self { Self::Managed { command: Box::new(command), fault } }
     pub(crate) fn create(
         record: crate::types::TimerRecord,
         fault: Option<TransitionFaultPoint>,
@@ -96,6 +99,7 @@ impl PreparedTimerTransition {
     }
     fn record(&self) -> &crate::types::TimerRecord {
         match self {
+            Self::Managed { command, .. } => command.record(),
             Self::Create { record, .. } => record,
             Self::Fire { command, .. } => &command.record,
             Self::Cancel { command, .. } => &command.record,
@@ -143,6 +147,7 @@ impl PreparedTimerTransition {
             "Timer command namespace differs"
         );
         match self {
+            Self::Managed { command, .. } => command.validate(&scope.agent_id,scope.identity_incarnation)?,
             Self::Create { record, .. } => anyhow::ensure!(
                 record.status == crate::types::TimerStatus::Active && record.fire_count == 0,
                 "Timer creation is not a fresh Active timer"
@@ -207,6 +212,16 @@ impl PreparedTimerTransition {
         let _resource_io = resume_material(&scheduling.phase)?;
         let mut value = TransitionCommit::default();
         let outcome = match self {
+            Self::Managed { command, fault } => {
+                inject_fault(*fault, TransitionFaultPoint::AfterValidation)?;
+                let actual=command.execute_tx(tx)?;
+                value.applied=true;
+                value.effects.fault=*fault;
+                value.effects.scheduling_write_keys.insert(timer_selector(&actual.id)?);
+                value.effects.timers.push(actual.clone());
+                inject_fault(*fault, TransitionFaultPoint::AfterCanonicalWrites)?;
+                TimerMutationOutcome::Managed { record: actual }
+            }
             Self::Create { record, fault } => {
                 inject_fault(*fault, TransitionFaultPoint::AfterValidation)?;
                 repositories::upsert_timer_tx(tx, record)?;
@@ -344,7 +359,7 @@ impl PreparedTimerTransition {
     }
     pub(super) fn fault(&self) -> Option<TransitionFaultPoint> {
         match self {
-            Self::Create { fault, .. } | Self::Fire { fault, .. } | Self::Cancel { fault, .. } => {
+            Self::Managed { fault, .. } | Self::Create { fault, .. } | Self::Fire { fault, .. } | Self::Cancel { fault, .. } => {
                 *fault
             }
         }
@@ -545,6 +560,11 @@ pub(super) fn prepare_tx<'tx, 'conn>(
     if let Some(timer) = timer {
         timer.validate(scope)?;
         match timer {
+            PreparedTimerTransition::Managed { command, .. } => {
+                if matches!(command.as_ref(),crate::runtime_db::managed_timers::ManagedMutation::Create{..}) {
+                    anyhow::ensure!(proof.fact_before(&timer_key).is_none(),"managed timer already exists");
+                }
+            }
             PreparedTimerTransition::Create { .. } => anyhow::ensure!(
                 proof.fact_before(&timer_key).is_none(),
                 "Timer creation ID already exists"

@@ -186,6 +186,25 @@ async fn tool_continuation_reselection(retry_before_cooling: bool) {
         )
         .await
         .unwrap());
+    // Observe the actual reselected request and its own policy, never the primary's policy.
+    let observations = runtime.storage().read_recent_events(256).unwrap();
+    let samples: Vec<_> = observations.iter().filter(|e| e.kind == "chat_context_observed").collect();
+    let first = samples.iter().find(|e| e.data["model"].as_str().is_some_and(|m| m.contains("gpt"))).unwrap();
+    let fallback_sample = samples.iter().find(|e| e.data["model"].as_str().is_some_and(|m| m.contains("claude"))).unwrap();
+    assert_ne!(first.data["model"], fallback_sample.data["model"]);
+    assert_ne!(first.data["context_window_tokens"], fallback_sample.data["context_window_tokens"]);
+    for sample in samples {
+        let route = crate::config::ModelRouteRef::parse_compatible(sample.data["model"].as_str().unwrap()).unwrap();
+        let snapshot = runtime.inner.config_snapshot.load();
+        let policy = snapshot.model_catalog.resolved_model_policy(&snapshot.base_context_config, Some(&route));
+        assert_eq!(sample.data["context_window_tokens"], serde_json::json!(policy.context_window_tokens));
+        assert_eq!(sample.data["prompt_budget_estimated_tokens"], policy.prompt_budget_estimated_tokens);
+        assert_eq!(sample.data["compaction_trigger_estimated_tokens"], policy.compaction_trigger_estimated_tokens);
+        assert!(sample.data["requested_model"].as_str().unwrap().contains("gpt"));
+        assert_eq!(sample.data["incarnation"], runtime.inner.identity_incarnation);
+        assert!(sample.data["run_id"].as_str().is_some());
+        assert!(sample.data["estimated_tokens"].as_u64().unwrap() > 0);
+    }
     let primary_body = primary_requests.lock().unwrap()[0].to_string();
     assert!(
         !primary_body.contains("function_call_output") && !primary_body.contains("tool_result"),

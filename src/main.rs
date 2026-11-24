@@ -6962,6 +6962,7 @@ async fn handle_agent_command(config: &AppConfig, command: Option<AgentCommands>
                 config,
                 &format!("/control/agents/{agent_id}/create"),
                 &http::CreateAgentRequest {
+                    default_initial_message: None,
                     authority_class: Some(AuthorityClass::OperatorInstruction),
                     name: None,
                     template,

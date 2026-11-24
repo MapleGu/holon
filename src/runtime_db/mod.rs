@@ -43,6 +43,8 @@ pub(crate) mod input_recovery_install;
 mod legacy_scheduler_wire;
 mod migration_history;
 pub mod migrations;
+pub mod managed_timers;
+pub mod operator_prompt_receipts;
 pub mod persistence;
 pub(crate) mod prepared_input_evidence;
 pub mod provider_admission;

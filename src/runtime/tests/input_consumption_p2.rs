@@ -804,7 +804,7 @@ fn assert_live_bounds(turn: &TurnRecord) {
         assert!(!batch.activation_id.is_empty());
         assert!(batch.safe_point.provider_round > 0);
         assert!(batch.max_items <= 8);
-        assert!(batch.max_bytes <= 24 * 1024);
+        assert!(batch.max_bytes <= input_consumption::INPUT_BATCH_BYTES);
         assert!(batch.rendered_bytes <= batch.max_bytes);
         let identity_count = batch.result_identities.len() + batch.ordinary_message_ids.len();
         assert!(identity_count <= batch.max_items);

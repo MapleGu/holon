@@ -24,6 +24,9 @@ pub(crate) const NAME: &str = crate::tool::names::EXEC_COMMAND;
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecCommandArgs {
     pub(crate) cmd: String,
+    /// Human-readable concrete target and action for this invocation; display metadata, never executed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
     pub(crate) workdir: Option<String>,
     pub(crate) shell: Option<String>,
     pub(crate) login: Option<bool>,

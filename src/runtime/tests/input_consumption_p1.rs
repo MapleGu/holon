@@ -3168,18 +3168,19 @@ async fn p1_result_bytes_are_reserved_before_the_source_ledger_admits() {
         &sender,
         &target,
         "budget-anchor",
-        "check pending result budget",
+        &"check pending result budget ".repeat(180),
         &owner.id,
     )
     .await;
     let mut results = Vec::new();
-    for index in 0..7 {
+    for index in 0..8 {
         results.push(
             publish_owner_result(
                 &target,
                 &owner.id,
                 format!("large-task-{index}-{}", "x".repeat(1900)),
-                "terminal result",
+                // Grow result content, not identity keys: Task/fence limits stay valid.
+                &"terminal result ".repeat(input_consumption::INPUT_BATCH_BYTES / 256),
             )
             .await,
         );
@@ -3201,7 +3202,7 @@ async fn p1_result_bytes_are_reserved_before_the_source_ledger_admits() {
         crate::context::render_pending_task_result_records(&target.storage(), &anchor, &candidates)
             .unwrap()
             .unwrap();
-    assert!(pending.len() > input_consumption::INPUT_BATCH_BYTES);
+    assert!(pending.len() > input_consumption::INPUT_BATCH_BYTES, "pending={} limit={}", pending.len(), input_consumption::INPUT_BATCH_BYTES);
     process_one(&target).await;
     let first_record = target
         .inner
@@ -3231,6 +3232,15 @@ async fn p1_result_bytes_are_reserved_before_the_source_ledger_admits() {
             None
         )
     );
+    // Anchor + seven results fit the item cap. The byte reservation must
+    // nevertheless defer at least one more result, so this cannot pass merely
+    // because the eight-item cap leaves the eighth result pending.
+    let settled = results.iter().filter(|id| {
+        target.inner.runtime_db.task_result_settlements()
+            .latest_for_message(id).unwrap().unwrap().state
+            == crate::runtime_db::task_result_settlement::TaskResultSettlementState::Settled
+    }).count();
+    assert!(settled < input_consumption::INPUT_BATCH_ITEMS - 1, "settled={settled}");
     assert_eq!(provider.requests.lock().await.len(), 1);
 }
 

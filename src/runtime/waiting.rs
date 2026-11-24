@@ -1924,6 +1924,7 @@ impl RuntimeHandle {
         &self,
         timer_id: &str,
     ) -> Result<TimerCancellationOutcome> {
+        anyhow::ensure!(!crate::runtime_db::managed_timers::is_managed(timer_id), "managed timer requires fenced cancellation");
         let agent_id = self.agent_id().await?;
         for attempt in 0..super::ENQUEUE_AGENT_STATE_MAX_ATTEMPTS {
             let mut guard = self.begin_mutation().await?;
@@ -2129,7 +2130,7 @@ impl RuntimeHandle {
         Ok(())
     }
 
-    async fn spawn_timer_loop(&self, timer: TimerRecord) -> Result<()> {
+    pub(super) async fn spawn_timer_loop(&self, timer: TimerRecord) -> Result<()> {
         let _registration = self.begin_mutation().await?;
         let owned = _registration.capture_timer_producer_read(&timer)?;
         let current = owned.timer;
@@ -2214,6 +2215,7 @@ impl RuntimeHandle {
     }
 
     pub(super) async fn fire_timer_record(&self, timer: &mut TimerRecord) -> Result<()> {
+        if crate::runtime_db::managed_timers::is_managed(&timer.id) { return self.fire_managed_timer_record(timer).await; }
         let mut first_guard = self.begin_mutation().await?;
         let first_read = first_guard
             .prepare_timer_mutation_read(&timer.id, Some(timer), true)

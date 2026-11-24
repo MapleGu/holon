@@ -24215,6 +24215,17 @@ async fn conversation_stream_exposes_progress_and_tool_before_result_delivery() 
         .await
         .expect("tool completes before the gated final response");
     let events = runtime.storage().read_recent_events(64).unwrap();
+    // Both real native rounds publish request estimates before the final provider
+    // response is released. These are not billed usage or assistant text.
+    let measured: Vec<_> = events.iter().filter(|event| event.kind == "chat_context_observed").collect();
+    assert_eq!(measured.len(), 2);
+    for event in measured {
+        assert_eq!(event.data["incarnation"], runtime.inner.identity_incarnation);
+        assert!(event.data["estimated_tokens"].as_u64().unwrap() > 0);
+        assert!(event.data["run_id"].as_str().is_some());
+        assert!(event.data.get("input_tokens").is_none());
+        assert!(event.data.get("text").is_none());
+    }
     let projection = events
         .iter()
         .find(|event| event.kind == "provider_round_completed")

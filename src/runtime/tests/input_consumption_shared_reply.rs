@@ -403,7 +403,7 @@ async fn p1_shared_reply_oversize_and_ordinary_inputs_share_identity_and_byte_li
             batch.identities.len() + batch.ordinary_sources <= 8,
             "{batch:?}"
         );
-        assert!(batch.rendered_bytes <= 24 * 1024, "{batch:?}");
+        assert!(batch.rendered_bytes <= input_consumption::INPUT_BATCH_BYTES, "{batch:?}");
         assert!(
             !all_settled(runtime, &sources),
             "overflow must remain durable"

@@ -870,6 +870,7 @@ impl LocalClient {
                 authority_class: Some(AuthorityClass::OperatorInstruction),
                 name: None,
                 template,
+                default_initial_message: None,
             },
         )
         .await

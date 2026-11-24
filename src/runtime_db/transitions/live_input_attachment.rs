@@ -762,7 +762,7 @@ fn restore_initial_snapshot_tx(
         || batch.items.first().map(|item| item.message_id.as_str()) != Some(source.id.as_str())
         || batch.max_items > 8
         || batch.items.len() > batch.max_items
-        || batch.max_bytes > 24 * 1024
+        || batch.max_bytes > crate::runtime::input_consumption::INPUT_BATCH_BYTES
         || batch.rendered_bytes > batch.max_bytes
         || header.len()
             + batch

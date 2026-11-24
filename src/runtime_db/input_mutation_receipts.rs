@@ -411,7 +411,7 @@ impl InputMutationOutcome {
                 );
                 use super::transitions::TimerMutationOutcome;
                 match outcome.as_ref() {
-                    TimerMutationOutcome::Created { record } => ensure!(
+                    TimerMutationOutcome::Created { record } | TimerMutationOutcome::Managed { record } => ensure!(
                         prepared
                             .scopes()
                             .iter()

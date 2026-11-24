@@ -599,3 +599,26 @@ async fn context_admission_compact_survives_restart_and_reaches_provider_with_or
         source.body
     );
 }
+
+
+// Downstream regression for the released 24 KiB -> 32 KiB input headroom.
+// Real admission must preserve a complete instruction above the old ceiling.
+#[tokio::test]
+async fn context_admission_headroom_preserves_full_25k_instruction() {
+    let (_home, _workspace, runtime) = runtime_fixture();
+    let text = format!("HEADROOM_START\n{}\nHEADROOM_END", "h".repeat(25_077));
+    let prepared = prepared_input("headroom-25k", text.clone());
+    runtime.agent_message_delivery_service().deliver(&prepared).await.unwrap();
+    let anchor = start(&runtime).await;
+    let item = input_consumption::projection::admitted_item(
+        runtime.storage(), "budget-target", &anchor.id,
+    ).unwrap().expect("the original input must be admitted with 32 KiB headroom");
+    assert!(item.rendered.len() > 24 * 1024);
+    assert!(item.rendered.len() <= 32 * 1024);
+    assert!(item.rendered.contains("representation: full"));
+    assert!(item.rendered.contains(&text));
+    assert_eq!(anchor.id, prepared.message.id);
+    let prompt = build(&runtime, &anchor, &context_config()).await;
+    assert!(prompt.context_plan_evidence.allocated_estimated_tokens
+        <= prompt.context_plan_evidence.total_budget_estimated_tokens);
+}

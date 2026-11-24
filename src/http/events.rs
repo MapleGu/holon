@@ -202,6 +202,12 @@ impl Serialize for PublicEventPayload<'_> {
         };
         let mut map = serializer.serialize_map(None)?;
         for (key, value) in object {
+            if key == "chat_compaction" {
+                if let Some(safe) = public_chat_compaction(value) {
+                    map.serialize_entry(key, &safe)?;
+                }
+                continue;
+            }
             if !PRIVATE_EVENT_PAYLOAD_KEYS.contains(&key.as_str()) {
                 map.serialize_entry(key, value)?;
             }
@@ -644,6 +650,44 @@ mod material_tests {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+fn public_chat_compaction(value: &Value) -> Option<Value> {
+    let state = value.get("state")?.as_str()?;
+    if !matches!(state, "succeeded" | "failed") || value.get("kind")?.as_str()? != "remote" { return None; }
+    let incarnation = value.get("incarnation")?.as_u64()?;
+    let run_id = value.get("run_id")?.as_str()?;
+    if run_id.is_empty() || run_id.len() > 240 || !run_id.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) { return None; }
+    Some(serde_json::json!({"state": state, "kind": "remote", "run_id": run_id, "incarnation": incarnation}))
+}
+
+#[cfg(test)]
+mod chat_runtime_wire_tests {
+    use super::*;
+    #[test]
+    fn public_event_payload_preserves_only_safe_compaction_http_shape() -> Result<()> {
+        let mut event = AuditEvent::legacy("provider_round_completed", serde_json::json!({
+            "provider_request_diagnostics": {"openai_remote_compaction": {"status": "compacted", "error": "SECRET"}},
+            "chat_compaction": {"state": "succeeded", "kind": "remote", "run_id": "run-1", "incarnation": 7,
+                "error": "SECRET", "endpoint": "PRIVATE", "provider_request_diagnostics": {"secret": true}}
+        }));
+        event.event_seq = 12;
+        let wire = serde_json::to_value(borrowed_event_envelope("native", "epoch-1", &event, false))?;
+        assert!(wire["payload"].get("provider_request_diagnostics").is_none());
+        assert_eq!(wire["payload"]["chat_compaction"], serde_json::json!({"state":"succeeded","kind":"remote","run_id":"run-1","incarnation":7}));
+        assert!(!wire.to_string().contains("SECRET"));
+        assert!(!wire.to_string().contains("PRIVATE"));
+        if let Ok(path) = std::env::var("HOLON_CHAT_WIRE_FIXTURE") {
+            std::fs::write(path, serde_json::to_vec_pretty(&serde_json::json!({"event_log_epoch":"epoch-1","newest_seq":12,"events":[wire]}))?)?;
+        }
+        for value in [serde_json::json!({"state":"running","kind":"remote","run_id":"run-1","incarnation":7}),
+            serde_json::json!({"state":"succeeded","kind":"remote","run_id":"https://private","incarnation":7}),
+            serde_json::json!({"state":"failed","kind":"remote","run_id":"run-1"})] {
+            let payload = serde_json::json!({"chat_compaction": value});
+            assert!(serde_json::to_value(PublicEventPayload(&payload))?.get("chat_compaction").is_none());
         }
         Ok(())
     }

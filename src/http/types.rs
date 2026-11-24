@@ -574,6 +574,9 @@ pub struct ClearAgentTimezoneRequest {
 pub struct CreateAgentRequest {
     pub authority_class: Option<AuthorityClass>,
     pub template: Option<String>,
+    /// Omission preserves the default initialization turn; false skips only that message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_initial_message: Option<bool>,
     #[serde(default)]
     pub name: Option<String>,
 }

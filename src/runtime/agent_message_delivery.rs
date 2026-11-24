@@ -59,6 +59,15 @@ impl AgentMessageDeliveryService<'_> {
         Ok(receipt)
     }
 
+    /// Exact locator shared by POST admission and read-only recovery. Does not
+    /// recreate semantic content, attachments, environment or request digest.
+    pub(crate) fn idempotency_locator(principal:&str,target:&str,key:&str)->Result<(String,String,String)> {
+        let scope=format!("{DELIVERY_IDEMPOTENCY_NAMESPACE}:{principal}:{target}");
+        let digest=digest(b"holon.agent-message-delivery.idempotency-key.v1",&key)?;
+        let id=crate::ids::agent_message_delivery_id(&scope,&digest);
+        Ok((scope,digest,id))
+    }
+
     pub(crate) fn prepare(
         request: AgentMessageSendRequest,
         mut caller: AgentMessageCallerContext,
@@ -113,13 +122,8 @@ impl AgentMessageDeliveryService<'_> {
             .causation_id
             .clone()
             .or_else(|| inherited.map(|route| route.message_id.clone()));
-        let idempotency_scope = format!(
-            "{DELIVERY_IDEMPOTENCY_NAMESPACE}:{}:{}",
-            caller.caller_principal, request.target_agent_id
-        );
-        let idempotency_key_digest = digest(
-            b"holon.agent-message-delivery.idempotency-key.v1",
-            &request.client_idempotency_key,
+        let (idempotency_scope, idempotency_key_digest, delivery_id) = Self::idempotency_locator(
+            &caller.caller_principal, &request.target_agent_id, &request.client_idempotency_key,
         )?;
         let request_digest = digest(
             b"holon.agent-message-delivery.request.v1",
@@ -133,8 +137,6 @@ impl AgentMessageDeliveryService<'_> {
                 caller: &caller,
             },
         )?;
-        let delivery_id =
-            crate::ids::agent_message_delivery_id(&idempotency_scope, &idempotency_key_digest);
         let now = Utc::now();
         let mut message = MessageEnvelope::new(
             request.target_agent_id.clone(),
