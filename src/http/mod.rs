@@ -670,6 +670,7 @@ pub fn router(state: AppState) -> Router {
             "/control/agents/{agent_id}/work-items/{work_item_id}",
             patch(tasks::update_work_item),
         )
+        .route("/control/agents/{agent_id}/work-items/{work_item_id}/wait", post(tasks::wait_work_item))
         .route(
             "/control/agents/{agent_id}/work-items/{work_item_id}/complete",
             post(tasks::complete_work_item),
@@ -773,6 +774,10 @@ pub fn router(state: AppState) -> Router {
             get(control::runtime_readiness),
         )
         .route("/control/runtime/status", get(control::runtime_status))
+        .route(
+            "/control/runtime/conditional-work-item-capabilities",
+            get(control::conditional_work_item_capabilities),
+        )
         .route(
             "/control/runtime/restricted-agent-capabilities",
             get(control::restricted_agent_capabilities),
@@ -4297,3 +4302,7 @@ mod tests {
 #[cfg(holon_lib_test_shard = "c")]
 #[path = "issue10_tests.rs"]
 mod issue10_tests;
+
+#[cfg(all(test, holon_lib_test_shard = "c"))]
+#[path = "conditional_work_item_tests.rs"]
+mod conditional_work_item_tests;

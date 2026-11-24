@@ -3305,6 +3305,33 @@ impl RuntimeHandle {
         })
     }
 
+    /// An accepted HTTP request may disconnect; the owned worker still resolves the one mutation.
+    pub async fn create_work_item_if_incarnation(
+        &self,
+        expected: u64,
+        objective: String,
+    ) -> Result<WorkItemRecord> {
+        crate::runtime_error::check_expected_incarnation(
+            self.inner.mutation_owner.agent_id(),
+            expected,
+            Some(self.instance_incarnation()),
+        )?;
+        anyhow::ensure!(!objective.trim().is_empty(), "objective must not be empty");
+        let admission = self.execution_admission_lease()?;
+        let runtime = self.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.spawn_owned_mutation(async move {
+            let _admission = admission;
+            let result = runtime
+                .create_work_item_inner(objective, None, None, Vec::new(), None, Some(expected))
+                .await;
+            let _ = send.send(result);
+        })?;
+        receive
+            .await
+            .context("conditional WorkItem worker ended without outcome")?
+    }
+
     pub async fn create_work_item(
         &self,
         objective: String,
@@ -3312,7 +3339,7 @@ impl RuntimeHandle {
         plan: Option<String>,
         todo_list: Vec<TodoItem>,
     ) -> Result<WorkItemRecord> {
-        self.create_work_item_inner(objective, plan_status, plan, todo_list, None)
+        self.create_work_item_inner(objective, plan_status, plan, todo_list, None, None)
             .await
     }
 
@@ -3323,7 +3350,7 @@ impl RuntimeHandle {
         plan: String,
         material: crate::diagnostics::resource_io::ResourceReadMaterial,
     ) -> Result<WorkItemRecord> {
-        self.create_work_item_inner(objective, None, Some(plan), vec![], Some(material))
+        self.create_work_item_inner(objective, None, Some(plan), vec![], Some(material), None)
             .await
     }
 
@@ -3334,6 +3361,7 @@ impl RuntimeHandle {
         plan: Option<String>,
         todo_list: Vec<TodoItem>,
         plan_material: Option<crate::diagnostics::resource_io::ResourceReadMaterial>,
+        expected_incarnation: Option<u64>,
     ) -> Result<WorkItemRecord> {
         let _admission = self.execution_admission_lease()?;
         let agent_id = self.agent_id().await?;
@@ -3354,6 +3382,14 @@ impl RuntimeHandle {
         let execution_protocol = self.plan_work_item_execution_create(&record)?;
         let commit = {
             let mut mutation = self.begin_mutation().await?;
+            if let Some(expected) = expected_incarnation {
+                // This owner reservation remains held through commit_work_transition.
+                crate::runtime_error::check_expected_incarnation(
+                    &mutation.state.id,
+                    expected,
+                    Some(self.instance_incarnation()),
+                )?;
+            }
             mutation.attach_plan_preparation(plan_preparation)?;
             mutation
                 .commit_work_transition(
@@ -4206,6 +4242,31 @@ impl RuntimeHandle {
             None,
         )
         .await
+    }
+
+    /// Register the native OperatorInput wait with no polling/recheck fallback.
+    pub async fn wait_work_item_for_event(&self, work_item_id: String, reason: String) -> Result<WorkItemRecord> {
+        anyhow::ensure!(!reason.trim().is_empty() && reason.len() <= 4096, "invalid event wait reason");
+        let _admission = self.execution_admission_lease()?;
+        let agent_id = self.agent_id().await?;
+        let mut mutation = self.begin_mutation().await?;
+        if mutation.state.current_run_id.is_some() || mutation.state.status == AgentStatus::AwakeRunning {
+            return Err(RuntimeError::new(crate::runtime_error::RuntimeErrorDomain::Conflict,
+                "work_item_execution_active", "event wait cannot settle an active execution").into());
+        }
+        let outcome = mutation.prepare_wait_for_outcome_with_id(
+            &agent_id, Some(work_item_id), super::WaitForWakeKind::OperatorInput,
+            None, reason, None, None,
+        ).await?;
+        let super::PrepareWaitForOutcome::Prepared(prepared) = outcome else {
+            anyhow::bail!("operator event wait did not produce a native wait transition");
+        };
+        let record = prepared.registration.work_item.clone().context("event wait missing WorkItem")?;
+        let commit = mutation.commit_wait_transition(crate::ids::audit_event_id(),
+            prepared.command.clone(), prepared.execution_protocol.clone(), prepared.expected_task.clone()).await?;
+        drop(mutation);
+        self.apply_transition_commit(commit).await;
+        Ok(record)
     }
 
     pub async fn update_work_item_fields_with_recheck(

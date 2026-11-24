@@ -447,7 +447,15 @@ pub struct CreateCommandTaskRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateWorkItemRequest {
+    /// Present means conditional create. Explicit null must not downgrade to legacy create.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expected_incarnation"
+    )]
+    pub expected_incarnation: Option<u64>,
     pub objective: String,
     pub authority_class: Option<AuthorityClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -482,10 +490,19 @@ pub struct UpdateWorkItemRequest {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompleteWorkItemRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_expected_incarnation")]
+    pub expected_incarnation: Option<u64>,
     pub report_text: String,
     pub authority_class: Option<AuthorityClass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_context: Option<crate::types::AgentInvocationContext>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WaitWorkItemRequest {
+    pub expected_incarnation: std::num::NonZeroU64,
+    pub reason: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

@@ -491,11 +491,24 @@ pub async fn create_work_item(
     if objective.is_empty() {
         return Err(bad_request("objective must not be empty"));
     }
-    let (runtime, record) = state
-        .host
-        .enqueue_public_work_item(&agent_id, objective)
-        .await
-        .map_err(agent_access_error)?;
+    let (runtime, record) = if let Some(expected) = request.expected_incarnation {
+        if objective.len() > 65536 {
+            return Err(bad_request(
+                "conditional objective exceeds 65536 UTF-8 bytes",
+            ));
+        }
+        state
+            .host
+            .enqueue_public_work_item_if_incarnation(&agent_id, expected, objective)
+            .await
+            .map_err(agent_access_error)?
+    } else {
+        state
+            .host
+            .enqueue_public_work_item(&agent_id, objective)
+            .await
+            .map_err(agent_access_error)?
+    };
     let boundary = current_boundary_metadata(&runtime)
         .await
         .map_err(error_response)?;
@@ -657,6 +670,14 @@ pub async fn complete_work_item(
     let admission_context = control_admission_context(&state);
     let provided_trust = request.authority_class;
     validate_invocation_context(request.invocation_context.as_ref(), provided_trust)?;
+    if let Some(expected) = request.expected_incarnation {
+        let id = work_item_id.clone();
+        let report = report_text.to_string();
+        let (_, record) = state.host.mutate_public_work_item_if_incarnation(&agent_id, expected, move |runtime| async move {
+            finish_control_work_item(&runtime, id, report).await
+        }).await.map_err(agent_access_error)?;
+        return Ok(Json(record));
+    }
     let runtime = state
         .host
         .get_operator_agent(&agent_id)
@@ -665,20 +686,29 @@ pub async fn complete_work_item(
     let boundary = current_boundary_metadata(&runtime)
         .await
         .map_err(error_response)?;
+    let record = finish_control_work_item(&runtime, work_item_id, report_text.to_string()).await.map_err(work_item_lifecycle_error)?;
+    runtime
+        .append_audit_event(
+            "work_item_complete_requested",
+            json!({
+                "work_item_id": record.id.clone(),
+                "target_agent_id": agent_id,
+                "admission_context": admission_context,
+                "provided_trust": provided_trust,
+                "boundary": boundary,
+            }),
+        )
+        .await
+        .map_err(error_response)?;
+    Ok(Json(record))
+}
+
+async fn finish_control_work_item(runtime: &crate::runtime::RuntimeHandle, work_item_id: String, report_text: String) -> anyhow::Result<crate::types::WorkItemRecord> {
     let existing = runtime
         .latest_work_item(&work_item_id)
         .await
-        .map_err(work_item_lifecycle_error)?
-        .ok_or_else(|| {
-            work_item_lifecycle_error(
-                RuntimeError::not_found(
-                    "work_item_not_found",
-                    format!("work item {work_item_id} not found"),
-                )
-                .with_safe_context("work_item_id", work_item_id.clone())
-                .into(),
-            )
-        })?;
+        ?
+        .ok_or_else(|| RuntimeError::not_found("work_item_not_found", format!("work item {work_item_id} not found")))?;
     let record = match existing.state {
         crate::types::WorkItemState::Open | crate::types::WorkItemState::Completed => runtime
             .complete_work_item_with_report(
@@ -695,7 +725,7 @@ pub async fn complete_work_item(
                 Vec::new(),
             )
             .await
-            .map_err(work_item_lifecycle_error)?
+            ?
             .into_record(),
         crate::types::WorkItemState::Completing => runtime
             .promote_work_item_completion_report(
@@ -706,21 +736,25 @@ pub async fn complete_work_item(
                 Vec::new(),
             )
             .await
-            .map_err(work_item_lifecycle_error)?,
+            ?,
     };
-    runtime
-        .append_audit_event(
-            "work_item_complete_requested",
-            json!({
-                "work_item_id": record.id.clone(),
-                "target_agent_id": agent_id,
-                "admission_context": admission_context,
-                "provided_trust": provided_trust,
-                "boundary": boundary,
-            }),
-        )
-        .await
-        .map_err(error_response)?;
+    Ok(record)
+}
+
+pub async fn wait_work_item(
+    Path((agent_id, work_item_id)): Path<(String, String)>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(request): ApiJson<WaitWorkItemRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    authorize_control(&headers, &state).map_err(authentication_error_response)?;
+    let reason = request.reason.trim().to_string();
+    if reason.is_empty() || reason.len() > 4096 { return Err(bad_request("reason must contain 1..4096 UTF-8 bytes")); }
+    let (_, record) = state.host.mutate_public_work_item_if_incarnation(
+        &agent_id, request.expected_incarnation.get(), move |runtime| async move {
+            runtime.wait_work_item_for_event(work_item_id, reason).await
+        },
+    ).await.map_err(agent_access_error)?;
     Ok(Json(record))
 }
 

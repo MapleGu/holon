@@ -90,7 +90,12 @@ const FIXED_DELETE_GUARDS: &[(&str, &str, &str)] = &[
 // Child/derived rows precede source rows. Optional memory tables share this DB.
 // Jointly owned records (reports, delegations, workspaces) are not in this list.
 const PRIVATE_TABLES: &[(&str, &str)] = &[
+    // Private cancellation receipts follow the target through archive and purge.
+    ("operator_prompt_cancellations", "agent_id"),
     ("restricted_agent_tool_settings", "agent_id"),
+    // 0005: request children precede managed metadata; both precede native timers.
+    ("managed_timer_requests", "agent_id"),
+    ("managed_timers", "agent_id"),
     // Domain projections are private content, not retained identity fences.
     ("current_read_qualification", "agent_id"),
     ("current_read_revisions", "agent_id"),
@@ -205,6 +210,11 @@ const PRIVATE_TABLES: &[(&str, &str)] = &[
 // Resolve ownerless projections through source rows, never their payload.
 // Export and purge must use exactly the same selectors.
 const DEPENDENT_TABLES: &[(&str, &str)] = &[
+    // Deliveries have no agent column: only their canonical timer owns them.
+    (
+        "managed_timer_deliveries",
+        "timer_id IN (SELECT timer_id FROM managed_timers WHERE agent_id = ?1)",
+    ),
     (
         "memory_documents_fts",
         "document_key IN (SELECT document_key FROM memory_documents WHERE agent_id = ?1)",
@@ -859,6 +869,7 @@ fn assert_no_live_resources_tx(tx: &Transaction<'_>, agent_id: &str) -> Result<(
         "SELECT EXISTS(SELECT 1 FROM tasks WHERE owner_agent_id = ?1 AND status IN ('queued','running','cancelling'))",
         "SELECT EXISTS(SELECT 1 FROM work_items WHERE agent_id = ?1 AND state != 'completed')",
         "SELECT EXISTS(SELECT 1 FROM timers WHERE agent_id = ?1 AND status = 'active')",
+        "SELECT EXISTS(SELECT 1 FROM managed_timer_deliveries d JOIN managed_timers m ON m.timer_id=d.timer_id WHERE m.agent_id=?1 AND d.status='pending')",
         "SELECT EXISTS(SELECT 1 FROM wait_conditions WHERE agent_id = ?1 AND status IN ('active','triggered'))",
         "SELECT EXISTS(SELECT 1 FROM workspace_occupancies WHERE holder_agent_id = ?1 AND released_at IS NULL)",
         "SELECT EXISTS(SELECT 1 FROM destructive_operations d JOIN turn_records t ON t.turn_id = d.owner_turn_id
@@ -904,8 +915,29 @@ fn quoted(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+// Metadata/request ownership must agree with their FK source before either
+// archive or purge. Never erase a foreign holder through a corrupt child index.
+fn assert_managed_timer_ownership_tx(tx: &Transaction<'_>, agent_id: &str) -> Result<()> {
+    if table_exists(tx, "managed_timers")? {
+        ensure!(!exists(tx,
+            "SELECT EXISTS(SELECT 1 FROM managed_timers m LEFT JOIN timers t ON t.timer_id=m.timer_id
+             WHERE (m.agent_id=?1 OR t.agent_id=?1)
+             AND (t.timer_id IS NULL OR m.agent_id != t.agent_id))", agent_id)?,
+            "managed timer ownership index mismatch");
+    }
+    if table_exists(tx, "managed_timer_requests")? {
+        ensure!(!exists(tx,
+            "SELECT EXISTS(SELECT 1 FROM managed_timer_requests r LEFT JOIN managed_timers m ON m.timer_id=r.timer_id
+             WHERE (r.agent_id=?1 OR m.agent_id=?1)
+             AND (m.timer_id IS NULL OR r.agent_id != m.agent_id OR r.incarnation != m.incarnation))", agent_id)?,
+            "managed timer request ownership index mismatch");
+    }
+    Ok(())
+}
+
 fn assert_safe_ownership_tx(tx: &Transaction<'_>, agent_id: &str) -> Result<()> {
     assert_command_ownership_tx(tx, agent_id)?;
+    assert_managed_timer_ownership_tx(tx, agent_id)?;
     // These records belong jointly to another principal, not just to this agent.
     for sql in [
         "SELECT EXISTS(SELECT 1 FROM content_reports WHERE agent_id = ?1)",
@@ -1969,6 +2001,7 @@ mod tests {
             super::super::input_mutation_receipts::INPUT_MUTATION_RECEIPT_SCHEMA,
             super::super::current_read_writes::SCHEMA,
             super::super::command_task_creation::SCHEMA,
+            super::super::managed_timers::SCHEMA,
             super::super::task_stop::TASK_STOP_SCHEMA,
             include_str!("control_transition/schema.sql"),
             include_str!("input_native_birth.rs"),
@@ -1988,6 +2021,7 @@ mod tests {
                     name == "task_status_source_inventory"
                         || PRIVATE_TABLES
                             .iter()
+                            .chain(DEPENDENT_TABLES)
                             .chain(DOMAIN_DEPENDENT_TABLES)
                             .chain(COMMAND_DEPENDENT_TABLES)
                             .any(|(table, _)| *table == name),
@@ -2358,7 +2392,10 @@ mod tests {
             assert_eq!(exported[table].as_array().unwrap().len(), 1, "{table}");
         }
         for &(table, _) in DEPENDENT_TABLES {
-            assert_eq!(exported[table].as_array().unwrap().len(), 1, "{table}");
+            // This legacy export fixture seeds only a native timer; managed
+            // children have their own nonempty archive/prune regression below.
+            let expected = if table == "managed_timer_deliveries" { 0 } else { 1 };
+            assert_eq!(exported[table].as_array().unwrap().len(), expected, "{table}");
         }
         for &table in RETAINED_TABLES {
             assert!(!exported.contains_key(table), "{table}");
@@ -2406,7 +2443,7 @@ mod tests {
                 assert!(payload.contains("ingress-b-default"), "{table}");
             }
             for &(table, predicate) in DEPENDENT_TABLES {
-                assert!(
+                assert_eq!(
                     exists(
                         tx,
                         &format!(
@@ -2415,6 +2452,7 @@ mod tests {
                         ),
                         "b"
                     )?,
+                    table != "managed_timer_deliveries",
                     "{table}"
                 );
             }
@@ -3229,6 +3267,279 @@ mod tests {
             );
             Ok(())
         })?;
+        Ok(())
+    }
+    fn managed_timer_fixture(db: &RuntimeDb, agent: &str) -> Result<String> {
+        let id = format!("managed_timer_synthetic_{agent}");
+        db.transaction(|tx| {
+            super::super::repositories::upsert_timer_tx(tx, &crate::types::TimerRecord {
+                id: id.clone(), agent_id: agent.into(), created_at: Utc::now(), calendar: None,
+                duration_ms: 1, interval_ms: None, repeat: false,
+                status: crate::types::TimerStatus::Completed, summary: Some("synthetic private timer".into()),
+                next_fire_at: None, last_fired_at: Some(Utc::now()), fire_count: 1,
+            })?;
+            tx.execute("INSERT INTO managed_timers VALUES (?1,?2,1,'synthetic-schedule',1,?3)",
+                params![id, agent, r#"{"kind":"once","at":1,"timeZone":"UTC"}"#])?;
+            tx.execute("INSERT INTO managed_timer_requests VALUES (?1,1,'synthetic-request','{}',?2)", params![agent, id])?;
+            for status in ["acknowledged", "cancelled"] {
+                tx.execute("INSERT INTO managed_timer_deliveries (delivery_id,timer_id,scheduled_at,fired_at,last_fired_at,fire_count,status) VALUES (?1,?2,1,1,1,1,?3)",
+                    params![format!("delivery-{agent}-{status}"), id, status])?;
+            }
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
+    fn managed_timer_rows(db: &RuntimeDb, agent: &str) -> Result<serde_json::Value> {
+        db.transaction(|tx| {
+            let mut result = serde_json::Map::new();
+            for (table, selector) in [
+                (
+                    "managed_timer_deliveries",
+                    "timer_id IN (SELECT timer_id FROM managed_timers WHERE agent_id=?1)",
+                ),
+                ("managed_timer_requests", "agent_id=?1"),
+                ("managed_timers", "agent_id=?1"),
+                ("timers", "agent_id=?1"),
+            ] {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT * FROM {table} WHERE {selector} ORDER BY 1"
+                ))?;
+                let names = statement
+                    .column_names()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
+                let mut rows = statement.query([agent])?;
+                let mut values: Vec<serde_json::Value> = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let mut value = serde_json::Map::new();
+                    for (i, name) in names.iter().enumerate() {
+                        let cell = match row.get_ref(i)? {
+                            rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                            rusqlite::types::ValueRef::Integer(n) => n.into(),
+                            rusqlite::types::ValueRef::Text(s) => std::str::from_utf8(s)?.into(),
+                            _ => anyhow::bail!("unexpected synthetic timer cell"),
+                        };
+                        value.insert(name.clone(), cell);
+                    }
+                    values.push(value.into());
+                }
+                result.insert(table.into(), values.into());
+            }
+            Ok(result.into())
+        })
+    }
+
+    #[test]
+    fn issue134_managed_timer_archive_and_prune_are_holder_only_and_fk_ordered() -> Result<()> {
+        let (_dir, db) = fixture()?;
+        managed_timer_fixture(&db, "a")?;
+        managed_timer_fixture(&db, "b")?;
+        let other = managed_timer_rows(&db, "b")?;
+        let holder = managed_timer_rows(&db, "a")?;
+        fence(&db)?;
+        settle_execution(&db, "a", 1, Utc::now())?;
+        db.transaction(|tx| {
+            assert_eq!(
+                tx.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))?,
+                1
+            );
+            let selected = private_history_selections_tx(tx)?;
+            let index = |name| {
+                selected
+                    .iter()
+                    .position(|(table, _)| *table == name)
+                    .unwrap()
+            };
+            assert!(index("managed_timer_deliveries") < index("managed_timer_requests"));
+            assert!(index("managed_timer_requests") < index("managed_timers"));
+            assert!(index("managed_timers") < index("timers"));
+            Ok(())
+        })?;
+        let archive = export_private_history(&db, "a", 1)?;
+        for table in [
+            "managed_timer_requests",
+            "managed_timers",
+            "managed_timer_deliveries",
+            "timers",
+        ] {
+            assert_eq!(archive["tables"][table], holder[table]);
+        }
+        assert_eq!(
+            managed_timer_rows(&db, "a")?,
+            holder,
+            "archive must not mutate source"
+        );
+        purge_private_history(&db, "a", 1, Utc::now())?;
+        assert_private_history_cleared(&db, "a")?;
+        let after = managed_timer_rows(&db, "a")?;
+        for value in after.as_object().unwrap().values() {
+            assert!(value.as_array().unwrap().is_empty());
+        }
+        assert_eq!(
+            managed_timer_rows(&db, "b")?,
+            other,
+            "foreign holder must remain byte-for-byte equivalent"
+        );
+        db.transaction(|tx| {
+            assert_eq!(
+                tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                    .get::<_, i64>(
+                    0
+                ))?,
+                0
+            );
+            Ok(())
+        })?;
+        purge_private_history(&db, "a", 1, Utc::now())?;
+        Ok(())
+    }
+
+    #[test]
+    fn issue134_managed_timer_cross_holder_and_incarnation_mismatch_fail_closed() -> Result<()> {
+        for corruption in [
+            "UPDATE managed_timers SET agent_id='b',schedule_id='synthetic-corrupt-schedule' WHERE agent_id='a'",
+            "UPDATE managed_timer_requests SET agent_id='b',request_id='synthetic-corrupt-request' WHERE agent_id='a'",
+            "UPDATE managed_timer_requests SET incarnation=2 WHERE agent_id='a'",
+        ] {
+            let (_dir, db) = fixture()?;
+            managed_timer_fixture(&db, "a")?;
+            managed_timer_fixture(&db, "b")?;
+            fence(&db)?;
+            settle_execution(&db, "a", 1, Utc::now())?;
+            db.transaction(|tx| {
+                tx.execute(corruption, [])?;
+                Ok(())
+            })?;
+            let a = managed_timer_rows(&db, "a")?;
+            let b = managed_timer_rows(&db, "b")?;
+            assert!(
+                format!("{:#}", export_private_history(&db, "a", 1).unwrap_err())
+                    .contains("ownership index mismatch")
+            );
+            assert!(
+                format!(
+                    "{:#}",
+                    purge_private_history(&db, "a", 1, Utc::now()).unwrap_err()
+                )
+                .contains("ownership index mismatch")
+            );
+            assert_eq!(managed_timer_rows(&db, "a")?, a);
+            assert_eq!(managed_timer_rows(&db, "b")?, b);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn issue134_managed_pending_delivery_blocks_prune_after_native_timer_completed() -> Result<()> {
+        let (_dir, db) = fixture()?;
+        let id = managed_timer_fixture(&db, "a")?;
+        fence(&db)?;
+        settle_execution(&db, "a", 1, Utc::now())?;
+        db.transaction(|tx| { tx.execute("UPDATE managed_timer_deliveries SET status='pending' WHERE timer_id=?1 AND status='acknowledged'", [&id])?; Ok(()) })?;
+        let before = managed_timer_rows(&db, "a")?;
+        assert!(
+            format!(
+                "{:#}",
+                purge_private_history(&db, "a", 1, Utc::now()).unwrap_err()
+            )
+            .contains("live resources")
+        );
+        assert_eq!(managed_timer_rows(&db, "a")?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issue134_managed_timer_archive_deletion_job_completes_after_expired_sleep()
+    -> Result<()> {
+        use crate::{config::AppConfig, host::RuntimeHost, provider::StubProvider};
+        let home = tempfile::tempdir()?;
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"model":{"default":"openai/gpt-5.4"}}"#,
+        )?;
+        let config = AppConfig::load_with_home(Some(home.path().into()))?;
+        let host = RuntimeHost::new_with_provider(
+            config,
+            std::sync::Arc::new(StubProvider::new("unused")),
+        )?;
+        let identity = host
+            .create_named_agent("synthetic-timer-holder", None)
+            .await?;
+        host.create_named_agent("synthetic-other-holder", None)
+            .await?;
+        host.unload_runtime("synthetic-timer-holder").await;
+        host.unload_runtime("synthetic-other-holder").await;
+        managed_timer_fixture(host.runtime_db(), "synthetic-timer-holder")?;
+        managed_timer_fixture(host.runtime_db(), "synthetic-other-holder")?;
+        let other = managed_timer_rows(host.runtime_db(), "synthetic-other-holder")?;
+        host.runtime_db().transaction(|tx| {
+            let mut state = AgentState::new("synthetic-timer-holder");
+            state.status = AgentStatus::Asleep;
+            state.sleeping_until = Some(Utc::now() - chrono::Duration::seconds(1));
+            upsert_agent_state_tx(tx, &state)
+        })?;
+        let (_, job, created) = host
+            .begin_public_agent_deletion_if_incarnation(
+                "synthetic-timer-holder",
+                false,
+                "synthetic-managed-timer-test",
+                true,
+                Some(identity.incarnation),
+            )
+            .await?;
+        assert!(created);
+        let archive_path = job.archive_path.clone().context("archive requested")?;
+        host.execute_deletion_job(job).await?;
+        let job = host
+            .runtime_db()
+            .agent_deletions()
+            .latest_for_agent("synthetic-timer-holder")?
+            .unwrap();
+        assert_eq!(
+            job.status,
+            crate::types::AgentDeletionStatus::Completed,
+            "{job:?}"
+        );
+        assert!(archive_path.is_file());
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(std::fs::File::open(
+            archive_path,
+        )?));
+        let mut history = None;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            if entry.path()? == std::path::Path::new("runtime-history.json") {
+                history = Some(serde_json::from_reader::<_, serde_json::Value>(&mut entry)?);
+            }
+        }
+        let history = history.context("sealed archive history")?;
+        for table in [
+            "managed_timer_requests",
+            "managed_timers",
+            "managed_timer_deliveries",
+            "timers",
+        ] {
+            assert!(!history["tables"][table].as_array().unwrap().is_empty());
+        }
+        assert_eq!(
+            managed_timer_rows(host.runtime_db(), "synthetic-other-holder")?,
+            other
+        );
+        for rows in managed_timer_rows(host.runtime_db(), "synthetic-timer-holder")?
+            .as_object()
+            .unwrap()
+            .values()
+        {
+            assert!(rows.as_array().unwrap().is_empty());
+        }
+        assert_eq!(
+            host.agent_identity_record("synthetic-timer-holder")?
+                .unwrap()
+                .status,
+            AgentRegistryStatus::Deleted
+        );
+        host.shutdown().await?;
         Ok(())
     }
 }

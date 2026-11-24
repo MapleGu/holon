@@ -784,3 +784,113 @@ async fn issue10_retired_conditional_delete_cannot_enable_archive() {
     );
     host.shutdown().await.unwrap();
 }
+
+
+#[tokio::test]
+async fn issue134_cancelled_operator_prompt_archives_and_purges_only_exact_agent() {
+    let (_home, host) = test_host();
+    let id = "cancel-delete-subject";
+    let foreign = "cancel-delete-foreign";
+    let identity = fixture(&host, id, AgentStatus::Asleep);
+    fixture(&host, foreign, AgentStatus::Asleep);
+    // The real cancellation path persists a receipt even before prompt admission.
+    // This is the release/cancel case after a model fixture rejects the prompt.
+    for agent in [id, foreign] {
+        let runtime = host
+            .activate_agent(agent, RuntimeActivationReason::OperatorControl)
+            .await
+            .unwrap();
+        runtime.wait_for_bootstrap().await.unwrap();
+        let cancelled = runtime
+            .cancel_operator_prompt(
+                runtime.instance_incarnation(),
+                "control".into(),
+                "synthetic-cancel-before-prompt".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled,
+            crate::runtime_db::operator_prompt_cancel::CancelStatus::Cancelled { message_id: None }
+        );
+        host.stop_public_agent_if_incarnation(agent, runtime.instance_incarnation())
+            .await
+            .unwrap();
+    }
+    let receipts = |agent: &str| {
+        host.runtime_db()
+            .with_read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM operator_prompt_cancellations WHERE agent_id=?1",
+                    [agent],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap()
+    };
+    assert_eq!(receipts(id), 1);
+    assert_eq!(receipts(foreign), 1);
+    let stale = host
+        .begin_public_agent_deletion_if_incarnation(
+            id,
+            false,
+            "synthetic",
+            true,
+            Some(identity.incarnation + 1),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{stale}").contains("target incarnation changed"));
+    assert_eq!(receipts(id), 1);
+    assert!(host
+        .runtime_db()
+        .agent_deletions()
+        .latest_for_agent(id)
+        .unwrap()
+        .is_none());
+    let (_, job, created) = host
+        .begin_public_agent_deletion_if_incarnation(
+            id,
+            false,
+            "synthetic",
+            true,
+            Some(identity.incarnation),
+        )
+        .await
+        .unwrap();
+    assert!(created);
+    host.execute_deletion_job(job.clone()).await.unwrap();
+    let (deleted, completed) = host.public_agent_deletion_status(id).unwrap();
+    assert_eq!(deleted.status, AgentRegistryStatus::Deleted);
+    assert_eq!(deleted.incarnation, identity.incarnation);
+    let completed = completed.unwrap();
+    assert_eq!(completed.status, AgentDeletionStatus::Completed);
+    assert_eq!(completed.deletion_id, job.deletion_id);
+    let file = std::fs::File::open(completed.archive_path.unwrap()).unwrap();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut history = None;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap() == std::path::Path::new("runtime-history.json") {
+            let mut bytes = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut bytes).unwrap();
+            history = Some(serde_json::from_str::<serde_json::Value>(&bytes).unwrap());
+        }
+    }
+    let history = history.expect("sealed archive includes private history");
+    let rows = history["tables"]["operator_prompt_cancellations"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["agent_id"], id);
+    assert_eq!(rows[0]["incarnation"], identity.incarnation);
+    assert_eq!(rows[0]["principal"], "control");
+    assert!(rows[0]["message_id"].is_null());
+    assert_eq!(receipts(id), 0);
+    assert_eq!(receipts(foreign), 1);
+    assert_eq!(
+        host.agent_identity_record(foreign).unwrap().unwrap().status,
+        AgentRegistryStatus::Active
+    );
+    host.shutdown().await.unwrap();
+}

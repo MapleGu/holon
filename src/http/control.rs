@@ -1216,6 +1216,15 @@ pub async fn runtime_shutdown(
     Ok(Json(runtime_service.shutdown_response()))
 }
 
+/// Conditional WorkItem writes are bound to an exact agent incarnation.
+pub async fn conditional_work_item_capabilities(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    authorize_control(&headers, &state).map_err(authentication_error_response)?;
+    Ok(Json(json!({"conditional_work_item_create": true, "conditional_work_item_event_wait": true, "conditional_work_item_complete": true})))
+}
+
 pub async fn restricted_agent_capabilities(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

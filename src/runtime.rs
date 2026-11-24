@@ -8650,3 +8650,7 @@ mod begin_turn_input_tests;
 #[cfg(test)]
 #[path = "runtime/dispatch_run_projection_tests.rs"]
 mod dispatch_run_projection_tests;
+
+#[cfg(all(test, holon_lib_test_shard = "a"))]
+#[path = "runtime/conditional_work_item_tests.rs"]
+mod conditional_work_item_tests;

@@ -6718,6 +6718,7 @@ async fn handle_work_item_command(config: &AppConfig, command: WorkItemCommands)
                 config,
                 &format!("/control/agents/{agent}/work-items"),
                 &CreateWorkItemRequest {
+                    expected_incarnation: None,
                     objective,
                     authority_class: Some(cli_authority_class()?),
                     invocation_context: cli_invocation_context()?,
@@ -6792,6 +6793,7 @@ async fn handle_work_item_command(config: &AppConfig, command: WorkItemCommands)
                 config,
                 &format!("/control/agents/{agent}/work-items/{work_item_id}/complete"),
                 &CompleteWorkItemRequest {
+                    expected_incarnation: None,
                     report_text,
                     authority_class: Some(cli_authority_class()?),
                     invocation_context: cli_invocation_context()?,

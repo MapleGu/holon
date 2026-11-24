@@ -5663,6 +5663,43 @@ impl RuntimeHost {
             .map_err(PublicAgentError::Runtime)
     }
 
+    /// Host owns the lifecycle lock until the accepted mutation finishes, even on disconnect.
+    pub(crate) async fn mutate_public_work_item_if_incarnation<F, Fut>(
+        &self, agent_id: &str, expected_incarnation: u64, mutation: F,
+    ) -> std::result::Result<(RuntimeHandle, crate::types::WorkItemRecord), PublicAgentError>
+    where
+        F: FnOnce(RuntimeHandle) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<crate::types::WorkItemRecord>> + Send + 'static,
+    {
+        let host = self.clone();
+        let agent_id = agent_id.to_string();
+        self.run_owned_external_mutation(async move {
+            Ok(async move {
+                let lock = host.agent_bootstrap_lock(&agent_id);
+                let _guard = lock.lock().await;
+                let identity = host.agent_identity_record(&agent_id).map_err(PublicAgentError::Runtime)?;
+                crate::runtime_error::check_expected_incarnation(
+                    &agent_id, expected_incarnation, identity.as_ref().map(|i| i.incarnation),
+                ).map_err(PublicAgentError::Runtime)?;
+                host.public_agent_identity(&agent_id)?;
+                let runtime = host.activate_agent_observed_for_incarnation(
+                    &agent_id, RuntimeActivationReason::OperatorControl, None, Some(expected_incarnation),
+                ).await.map_err(Self::public_activation_error)?;
+                runtime.wait_for_bootstrap().await.map_err(PublicAgentError::Runtime)?;
+                let record = mutation(runtime.clone()).await.map_err(PublicAgentError::Runtime)?;
+                Ok((runtime, record))
+            }.await)
+        }).await.map_err(PublicAgentError::Runtime)?
+    }
+
+    pub async fn enqueue_public_work_item_if_incarnation(
+        &self, agent_id: &str, expected_incarnation: u64, objective: String,
+    ) -> std::result::Result<(RuntimeHandle, crate::types::WorkItemRecord), PublicAgentError> {
+        self.mutate_public_work_item_if_incarnation(agent_id, expected_incarnation, move |runtime| async move {
+            runtime.create_work_item_if_incarnation(expected_incarnation, objective).await
+        }).await
+    }
+
     pub async fn enqueue_public_work_item(
         &self,
         agent_id: &str,
