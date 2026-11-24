@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod error;
 pub(crate) mod helpers;
 pub mod names;
+pub mod restricted;
 pub(crate) mod schema_support;
 pub mod spec;
 pub(crate) mod summary;

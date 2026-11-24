@@ -1015,6 +1015,10 @@ impl RuntimeHandle {
         provider: std::sync::Arc<dyn AgentProvider>,
         mut request: ProviderTurnRequest,
     ) -> Result<(ProviderTurnResponse, Option<ProviderAttemptTimeline>)> {
+        if let Some(policy) = self.restricted_tool_allowlist().await? {
+            request.tools.retain(|tool| policy.check(&tool.name).is_ok());
+            request.native_web_search = None;
+        }
         request.dispatch_guard = self
             .active_provider_admission()?
             .map(|admission| admission as Arc<dyn crate::provider::ProviderDispatchGuard>);
@@ -2684,6 +2688,9 @@ impl RuntimeHandle {
                 }
             }
 
+            for call in &tool_calls {
+                runtime.check_restricted_tool(&call.name).await?;
+            }
             crate::diagnostics::record_turn_provider_round(provider_round_started.elapsed());
             crate::diagnostics::record_provider_round_total(provider_round_started.elapsed());
             let completed_round_assistant_blocks = assistant_blocks.clone();
@@ -2988,6 +2995,9 @@ impl RuntimeHandle {
                     // Private checkpoints cannot bind the operator-facing report.
                     *pending_wait_report = Some(pending);
                 } else {
+                    runtime
+                        .check_restricted_tool(crate::tool::names::WAIT_FOR)
+                        .await?;
                     let args = crate::tool::tools::wait_for::parse_wait_for_args(&pending.input)?;
                     let mut result = crate::tool::tools::wait_for::prepare_settlement(
                         runtime,
@@ -3313,6 +3323,9 @@ impl RuntimeHandle {
                         .iter()
                         .filter_map(|warning| serde_json::from_value(warning.clone()).ok())
                         .collect::<Vec<_>>();
+                    runtime
+                        .check_restricted_tool(crate::tool::names::COMPLETE_WORK_ITEM)
+                        .await?;
                     let mut result =
                         crate::tool::tools::complete_work_item::complete_with_report_candidate(
                             runtime,

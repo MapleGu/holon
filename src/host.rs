@@ -5682,6 +5682,7 @@ impl RuntimeHost {
         template: Option<&str>,
     ) -> Result<AgentIdentityRecord> {
         let desired = AgentBootstrapDesiredState {
+            tool_allowlist: None,
             template: template.map(ToString::to_string),
             catalog_agent_home: None,
             workspace: None,
@@ -5737,6 +5738,7 @@ impl RuntimeHost {
         default_initial_message: bool,
     ) -> Result<AgentCreateResult> {
         let desired = AgentBootstrapDesiredState {
+            tool_allowlist: None,
             template: template.map(ToString::to_string),
             catalog_agent_home: catalog_agent_home.map(Path::to_path_buf),
             workspace: None,
@@ -5750,6 +5752,34 @@ impl RuntimeHost {
             requested_name,
             desired,
             execution,
+        )
+        .await
+    }
+
+    pub(crate) async fn create_restricted_agent(
+        &self,
+        agent_id: &str,
+        template: Option<String>,
+        name: Option<String>,
+        default_initial_message: bool,
+        policy: crate::tool::restricted::ToolAllowlist,
+    ) -> Result<AgentCreateResult> {
+        policy.validate()?;
+        crate::tool::restricted::protect_store(self.runtime_db().path())?;
+        self.create_public_named_agent_with_bootstrap(
+            agent_id,
+            None,
+            name.as_deref(),
+            AgentBootstrapDesiredState {
+                tool_allowlist: Some(policy),
+                template,
+                catalog_agent_home: None,
+                workspace: None,
+                model_resolution: None,
+                initial_message: None,
+                default_initial_message,
+            },
+            AgentBootstrapExecution::Background,
         )
         .await
     }
@@ -5992,6 +6022,7 @@ impl RuntimeHost {
         // drops the intent when no model provider is ready yet.
         let default_initial_message = initial_message.is_none();
         let desired = AgentBootstrapDesiredState {
+            tool_allowlist: None,
             template: request.template,
             catalog_agent_home,
             workspace,
@@ -6135,6 +6166,7 @@ impl RuntimeHost {
             None,
         )
         .with_lineage_parent_agent_id(lineage_parent_agent_id.map(ToString::to_string));
+        record.tool_allowlist_required = desired.tool_allowlist.is_some();
         record.name = normalized_name;
         let bootstrap = AgentBootstrapRecord::new(agent_id, desired);
         let relations = independent_creation_records(
@@ -6263,6 +6295,7 @@ impl RuntimeHost {
                                 chrono::Utc::now(),
                                 tombstone.updated_at + chrono::Duration::nanoseconds(1),
                             );
+                            record.tool_allowlist_required = desired.tool_allowlist.is_some();
                             record.name = normalized_name.clone();
                             record.incarnation = tombstone.incarnation.saturating_add(1);
                             record.revision = tombstone.revision.saturating_add(1);
@@ -8217,6 +8250,9 @@ impl RuntimeHost {
             })
             .map(|(_, tool)| tool)
             .collect::<Vec<_>>();
+        let available_tools =
+            crate::tool::restricted::load(self.runtime_db(), &identity.agent_id, identity.incarnation)?
+                .map_or(available_tools, |policy| policy.specs());
         let prompt_tools = provider.prompt_tool_specs(&available_tools);
         let mut context_config = self.runtime_context_config();
         if let Some(budget) = budget_override {
@@ -9273,6 +9309,7 @@ impl RuntimeHost {
         let lineage_parent_agent_id = parent_state.id.clone();
         let default_initial_message = initial_message.is_none();
         let desired = AgentBootstrapDesiredState {
+            tool_allowlist: None,
             template,
             catalog_agent_home: Some(parent_agent_home),
             workspace: Some(AgentBootstrapWorkspaceState {
@@ -13769,6 +13806,7 @@ mod tests {
             NamedAgentExistingBehavior::Reuse,
             None,
             AgentBootstrapDesiredState {
+                tool_allowlist: None,
                 template: None,
                 catalog_agent_home: None,
                 workspace: None,

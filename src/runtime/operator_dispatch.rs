@@ -551,6 +551,9 @@ impl RuntimeHandle {
         &self,
         apply_patch_surface: ApplyPatchSurface,
     ) -> Result<Vec<crate::tool::ToolSpec>> {
+        if let Some(policy) = self.restricted_tool_allowlist().await? {
+            return Ok(policy.specs());
+        }
         let capability_policy = self.agent_capability_policy().await?;
         self.tool_specs_for_apply_patch_surface(apply_patch_surface, |family| {
             capability_policy
@@ -754,7 +757,12 @@ impl RuntimeHandle {
             native_search_provider.as_ref(),
             &web_config.search,
         );
-        let native_web_search = native_web_search_selection.request;
+        let restricted = self.restricted_tool_allowlist().await?;
+        let native_web_search = if restricted.is_some() {
+            None
+        } else {
+            native_web_search_selection.request
+        };
         let (apply_patch_surface, available_tools) = if let Some((state, allowed)) = captured {
             let surface = self.apply_patch_surface_for_turn(state, fallback_model);
             let tools =
@@ -769,6 +777,7 @@ impl RuntimeHandle {
                 .await?;
             (surface, tools)
         };
+        let available_tools = restricted.map_or(available_tools, |policy| policy.specs());
         let available_tools =
             filter_native_web_search_tools(available_tools, native_web_search.is_some());
         let available_tools = provider.prompt_tool_specs(&available_tools);

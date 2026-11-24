@@ -137,6 +137,10 @@ impl ToolRegistry {
         context: &ToolExecutionContext,
     ) -> Result<(ToolResult, ToolExecutionRecord)> {
         let started_at = chrono::Utc::now();
+        let restricted = runtime.restricted_tool_allowlist().await?;
+        if let Some(policy) = &restricted {
+            policy.check(&call.name)?;
+        }
         if call.name == "SpawnAgent" {
             return Err(ToolError::new("legacy_tool_removed", "SpawnAgent has been removed")
                 .with_details(json!({
@@ -148,48 +152,52 @@ impl ToolRegistry {
                 )
                 .into());
         }
-        let required_family = match self.family_for_tool(&call.name)? {
-            Some(required_family) => required_family,
-            None => {
+        if restricted.is_none() {
+            let required_family = match self.family_for_tool(&call.name)? {
+                Some(required_family) => required_family,
+                None => {
+                    return Err(ToolError::new(
+                        "unknown_tool",
+                        format!("{} is not an available tool", call.name),
+                    )
+                    .with_details(json!({
+                        "tool_name": call.name,
+                    }))
+                    .with_recovery_hint(format!(
+                        "use one of the advertised tool names from tool_specs() instead of {}",
+                        call.name
+                    ))
+                    .into());
+                }
+            };
+            if runtime
+                .agent_capability_policy()
+                .await?
+                .is_some_and(|policy| !policy.allows(required_family))
+            {
                 return Err(ToolError::new(
-                    "unknown_tool",
-                    format!("{} is not an available tool", call.name),
+                    "agent_capability_not_allowed",
+                    format!(
+                        "{} is not allowed by the agent capability policy",
+                        call.name
+                    ),
                 )
                 .with_details(json!({
                     "tool_name": call.name,
+                    "required_family": required_family.label(),
                 }))
                 .with_recovery_hint(format!(
-                    "use one of the advertised tool names from tool_specs() instead of {}",
-                    call.name
+                    "run {} from an agent whose capability policy allows the `{}` family",
+                    call.name,
+                    required_family.label()
                 ))
                 .into());
             }
-        };
-        if runtime
-            .agent_capability_policy()
-            .await?
-            .is_some_and(|policy| !policy.allows(required_family))
-        {
-            return Err(ToolError::new(
-                "agent_capability_not_allowed",
-                format!(
-                    "{} is not allowed by the agent capability policy",
-                    call.name
-                ),
-            )
-            .with_details(json!({
-                "tool_name": call.name,
-                "required_family": required_family.label(),
-            }))
-            .with_recovery_hint(format!(
-                "run {} from an agent whose capability policy allows the `{}` family",
-                call.name,
-                required_family.label()
-            ))
-            .into());
         }
         let tool_started = std::time::Instant::now();
-        let (result, input_coercion) =
+        let (result, input_coercion) = if let Some(policy) = restricted {
+            (policy.call(call).await, None)
+        } else {
             capture_tool_input_coercion(tools::execute_builtin_tool_with_context(
                 runtime,
                 agent_id,
@@ -197,7 +205,8 @@ impl ToolRegistry {
                 call,
                 context,
             ))
-            .await;
+            .await
+        };
         let mut result = result?;
         let pending = context
             .external_command_attempt

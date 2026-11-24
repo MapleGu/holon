@@ -161,6 +161,19 @@ fn execute_builtin_tool_inner<'a>(
     call: &'a ToolCall,
     context: &'a ToolExecutionContext,
 ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+    Box::pin(async move {
+        runtime.check_restricted_tool(&call.name).await?;
+        execute_builtin_tool_unguarded(runtime, agent_id, authority_class, call, context).await
+    })
+}
+
+fn execute_builtin_tool_unguarded<'a>(
+    runtime: &'a RuntimeHandle,
+    agent_id: &'a str,
+    authority_class: &'a AuthorityClass,
+    call: &'a ToolCall,
+    context: &'a ToolExecutionContext,
+) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
     macro_rules! defer_tool_future {
         ($future:expr) => {
             Box::pin(async move { Box::pin($future).await })

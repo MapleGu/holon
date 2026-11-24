@@ -119,6 +119,7 @@ mod state;
 mod tasks;
 mod managed_timers;
 mod operator_prompt_receipts;
+mod operator_prompt_cancel;
 mod templates;
 mod types;
 mod unread;
@@ -644,6 +645,7 @@ pub fn router(state: AppState) -> Router {
             get(state::worktree_summary),
         )
         .route("/control/agents/{agent_id}/prompt-receipt", get(operator_prompt_receipts::get))
+        .route("/control/agents/{agent_id}/prompt-cancel", post(operator_prompt_cancel::cancel))
         .route("/control/timers/preview", post(managed_timers::preview))
         .route("/control/agents/{agent_id}/managed-timers", get(managed_timers::list).post(managed_timers::create))
         .route("/control/agents/{agent_id}/managed-timers/{timer_id}", get(managed_timers::get))
@@ -683,6 +685,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/control/agents/{agent_id}/create",
             post(control::create_agent),
+        )
+        .route(
+            "/control/agents/{agent_id}/restricted/create",
+            post(control::create_restricted_agent),
         )
         .route("/control/agents/tree", get(control::agent_tree))
         .route(
@@ -767,6 +773,10 @@ pub fn router(state: AppState) -> Router {
             get(control::runtime_readiness),
         )
         .route("/control/runtime/status", get(control::runtime_status))
+        .route(
+            "/control/runtime/restricted-agent-capabilities",
+            get(control::restricted_agent_capabilities),
+        )
         .route(
             "/control/runtime/performance",
             get(control::runtime_performance),

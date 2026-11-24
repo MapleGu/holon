@@ -422,6 +422,8 @@ pub enum AgentRegistryStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct AgentIdentityRecord {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_allowlist_required: bool,
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -541,6 +543,9 @@ pub struct AgentBootstrapWorkspaceState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentBootstrapDesiredState {
+    /// Creation-only private input; never part of bootstrap projections.
+    #[serde(skip)]
+    pub(crate) tool_allowlist: Option<crate::tool::restricted::ToolAllowlist>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -705,6 +710,7 @@ impl AgentBootstrapRecord {
             agent_id: agent_id.into(),
             incarnation: None,
             desired: AgentBootstrapDesiredState {
+                tool_allowlist: None,
                 template: None,
                 catalog_agent_home: None,
                 workspace: None,
@@ -930,6 +936,7 @@ impl AgentIdentityRecord {
     ) -> Self {
         let now = Utc::now();
         Self {
+            tool_allowlist_required: false,
             agent_id: agent_id.into(),
             name: None,
             kind,

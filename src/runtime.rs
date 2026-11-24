@@ -156,6 +156,7 @@ mod turn;
 mod unsettled_claim;
 mod waiting;
 mod managed_timers;
+mod operator_prompt_cancel;
 mod wake_matching;
 mod work_reads;
 pub use work_reads::OwnedWorkItemsRead;
@@ -3898,6 +3899,23 @@ impl RuntimeHandle {
             }
         }
         Ok(self.fallback_identity_view(&agent_id))
+    }
+
+    pub(crate) async fn restricted_tool_allowlist(
+        &self,
+    ) -> Result<Option<crate::tool::restricted::ToolAllowlist>> {
+        crate::tool::restricted::load(
+            self.runtime_db(),
+            &self.agent_id().await?,
+            self.inner.identity_incarnation,
+        )
+    }
+
+    pub(crate) async fn check_restricted_tool(&self, name: &str) -> Result<()> {
+        if let Some(policy) = self.restricted_tool_allowlist().await? {
+            policy.check(name)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn agent_capability_policy(

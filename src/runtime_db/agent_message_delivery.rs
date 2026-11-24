@@ -778,6 +778,7 @@ pub(crate) fn prepare_delivery_admission_tx(
             .into());
         }
     }
+    super::operator_prompt_cancel::guard_admission(tx, candidate)?;
     if let Some(activation_id) = candidate.caller.routing_activation_id.as_deref() {
         let caller_id = candidate
             .caller

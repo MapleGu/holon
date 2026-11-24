@@ -2960,6 +2960,27 @@ INSERT INTO storage_domains (
     }
 
     #[test]
+    fn restricted_agent_upgrades_from_managed_timers_and_reopens_both_tables() -> Result<()> {
+        let (_temp_dir, db_path, lock_path) = temp_paths()?;
+        migrate_through(&mut open_connection(&db_path)?, 107)?;
+        for _ in 0..2 {
+            let db = RuntimeDb::open_and_migrate(&db_path, &lock_path)?;
+            let connection = db.connection()?;
+            assert!(table_exists(&connection, "restricted_agent_tool_settings")?);
+            assert!(table_exists(&connection, "operator_prompt_cancellations")?);
+            for (version, expected) in [(108, "restricted_agent_tool_allowlist"), (109, "operator_prompt_cancellations")] {
+                let name: String = connection.query_row(
+                    "SELECT name FROM schema_migrations WHERE version=?1",
+                    [version],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(name, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn agent_bootstrap_repository_round_trips_across_reopen() -> Result<()> {
         let (_temp_dir, db_path, lock_path) = temp_paths()?;
         {
@@ -2968,6 +2989,7 @@ INSERT INTO storage_domains (
             let bootstrap = AgentBootstrapRecord::new(
                 "bootstrap-agent",
                 AgentBootstrapDesiredState {
+                    tool_allowlist: None,
                     template: Some("worker".into()),
                     catalog_agent_home: None,
                     workspace: None,
@@ -8250,6 +8272,7 @@ CREATE TABLE working_memory_deltas (
                     let bootstrap = AgentBootstrapRecord::new(
                         "reborn",
                         AgentBootstrapDesiredState {
+                            tool_allowlist: None,
                             template: None,
                             catalog_agent_home: None,
                             workspace: None,
@@ -8324,6 +8347,7 @@ CREATE TABLE working_memory_deltas (
         let bootstrap = AgentBootstrapRecord::new(
             &tombstone.agent_id,
             AgentBootstrapDesiredState {
+                tool_allowlist: None,
                 template: None,
                 catalog_agent_home: None,
                 workspace: None,
@@ -8542,6 +8566,7 @@ CREATE TABLE working_memory_deltas (
                         AgentBootstrapRecord::new(
                             "missing",
                             AgentBootstrapDesiredState {
+                                tool_allowlist: None,
                                 template: None,
                                 catalog_agent_home: None,
                                 workspace: None,
@@ -8578,6 +8603,7 @@ CREATE TABLE working_memory_deltas (
                         AgentBootstrapRecord::new(
                             "still-active",
                             AgentBootstrapDesiredState {
+                                tool_allowlist: None,
                                 template: None,
                                 catalog_agent_home: None,
                                 workspace: None,
@@ -8620,6 +8646,7 @@ CREATE TABLE working_memory_deltas (
                         AgentBootstrapRecord::new(
                             "mid-delete",
                             AgentBootstrapDesiredState {
+                                tool_allowlist: None,
                                 template: None,
                                 catalog_agent_home: None,
                                 workspace: None,
@@ -8675,6 +8702,7 @@ CREATE TABLE working_memory_deltas (
                         AgentBootstrapRecord::new(
                             "reborn-guard",
                             AgentBootstrapDesiredState {
+                                tool_allowlist: None,
                                 template: None,
                                 catalog_agent_home: None,
                                 workspace: None,

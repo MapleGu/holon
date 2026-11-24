@@ -45,6 +45,7 @@ mod migration_history;
 pub mod migrations;
 pub mod managed_timers;
 pub mod operator_prompt_receipts;
+pub(crate) mod operator_prompt_cancel;
 pub mod persistence;
 pub(crate) mod prepared_input_evidence;
 pub mod provider_admission;
@@ -1060,7 +1061,11 @@ impl RuntimeDb {
                 backup_path.display()
             );
         }
-        let backup_path_text = backup_path.to_string_lossy().into_owned();
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&backup_path)?;
+        }
+        let backup_path_text = backup_path.to_str().ok_or_else(|| anyhow!("runtime database backup requires a UTF-8 path"))?;
         self.connection()?
             .execute("VACUUM INTO ?1", [&backup_path_text])
             .with_context(|| {

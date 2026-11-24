@@ -17,6 +17,7 @@ async fn cold_fixture(
                 NamedAgentExistingBehavior::Reuse,
                 None,
                 AgentBootstrapDesiredState {
+                    tool_allowlist: None,
                     default_initial_message: false,
                     template: None,
                     catalog_agent_home: None,

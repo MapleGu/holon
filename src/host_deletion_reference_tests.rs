@@ -387,6 +387,7 @@ mod deletion_reference_tests {
                     let bootstrap = crate::types::AgentBootstrapRecord::new(
                         SOURCE_CHILD,
                         crate::types::AgentBootstrapDesiredState {
+                            tool_allowlist: None,
                             template: None,
                             catalog_agent_home: None,
                             workspace: None,

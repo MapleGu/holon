@@ -68,6 +68,8 @@ pub(crate) struct PreparedQueueTransition {
     pub extra_wait_conditions: Vec<WaitConditionRecord>,
     pub delivery: Option<AgentMessageDeliveryRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cancel: Option<crate::runtime_db::operator_prompt_cancel::CancelScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message_wait_scope: Option<InputEvidenceScope>,
     pub timer_wake_claim: Option<TimerWakeClaim>,
     pub task_result_settlement:
@@ -89,6 +91,7 @@ impl PreparedQueueTransition {
             terminal_tool_executions: Vec::new(),
             extra_wait_conditions: Vec::new(),
             delivery: None,
+            prompt_cancel: None,
             message_wait_scope: None,
             timer_wake_claim: None,
             task_result_settlement: None,
@@ -3389,6 +3392,9 @@ impl RuntimeTransitionRepository<'_> {
                     InputMutationResult::Transition,
                 ),
                 InputTransitionCommand::Queue(queue) => {
+                    if let Some(cancel) = &queue.prompt_cancel {
+                        cancel.require_queued_tx(tx, &queue.command)?;
+                    }
                     let apply = if let Some(admission) = &queue.supervised_invocation {
                         match super::supervised_invocation::prepare_admission_tx(
                             tx,
@@ -3466,6 +3472,13 @@ impl RuntimeTransitionRepository<'_> {
                     } else {
                         TransitionCommit::default()
                     };
+                    if let Some(cancel) = &queue.prompt_cancel {
+                        anyhow::ensure!(
+                            value.applied,
+                            crate::runtime_db::operator_prompt_cancel::unavailable()
+                        );
+                        cancel.persist_tx(tx, Some(&queue.command.mutation))?;
+                    }
                     if let Some(guard) = stopped_pause_guard {
                         value.effects.task_material_budget_views.push(guard);
                     }

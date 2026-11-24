@@ -18,6 +18,10 @@ pub enum OperatorPromptRecoveryStatus {
         #[serde(rename = "messageId")]
         message_id: String,
     },
+    Cancelled {
+        #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
     NotFound,
     Unknown,
 }
@@ -52,6 +56,18 @@ pub(crate) fn lookup(
         identity.agent_incarnation == inc,
         ConversationReadError::IdentityChanged
     );
+    let cancel =
+        super::operator_prompt_cancel::CancelScope::new(agent.into(), inc, principal.into(), key)?;
+    if let Some(super::operator_prompt_cancel::CancelStatus::Cancelled { message_id }) =
+        cancel.receipt(c)?
+    {
+        return Ok(OperatorPromptRecovery {
+            agent_id: agent.into(),
+            incarnation: inc,
+            client_request_id: request_id.into(),
+            outcome: OperatorPromptRecoveryStatus::Cancelled { message_id },
+        });
+    }
     let (scope, digest, id) =
         AgentMessageDeliveryService::idempotency_locator(principal, agent, key)?;
     let payload:Option<String>=c.query_row("SELECT payload_json FROM agent_message_deliveries WHERE delivery_id=?1 AND target_agent_id=?2 AND idempotency_scope=?3 AND idempotency_key_digest=?4",params![id,agent,scope,digest],|r|r.get(0)).optional()?;

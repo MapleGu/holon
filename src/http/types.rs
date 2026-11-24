@@ -587,6 +587,18 @@ pub struct CreateAgentRequest {
     pub name: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateRestrictedAgentRequest {
+    pub tool_allowlist: crate::tool::restricted::ToolAllowlist,
+    pub authority_class: Option<AuthorityClass>,
+    pub template: Option<String>,
+    /// Omission preserves the default initialization turn; false skips only that message.
+    pub default_initial_message: Option<bool>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 // Omission is unconditional; explicit null/zero/malformed values never are.
 fn deserialize_expected_incarnation<'de, D: serde::Deserializer<'de>>(
     deserializer: D,

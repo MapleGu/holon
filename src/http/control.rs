@@ -1216,6 +1216,14 @@ pub async fn runtime_shutdown(
     Ok(Json(runtime_service.shutdown_response()))
 }
 
+pub async fn restricted_agent_capabilities(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    authorize_control(&headers, &state).map_err(authentication_error_response)?;
+    Ok(Json(json!({"toolAllowlist": true, "promptCancellation": true})))
+}
+
 pub async fn create_agent(
     Path(agent_id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -1223,9 +1231,7 @@ pub async fn create_agent(
     ApiJson(request): ApiJson<CreateAgentRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     authorize_control(&headers, &state).map_err(authentication_error_response)?;
-    let admission_context = control_admission_context(&state);
-    let provided_trust = request.authority_class;
-    let mut created = state
+    let created = state
         .host
         .create_public_named_agent_with_name(
             &agent_id,
@@ -1234,22 +1240,67 @@ pub async fn create_agent(
             None,
             request.name.as_deref(),
             crate::host::AgentBootstrapExecution::Background,
-            // Keep the historical initialization turn unless this creation explicitly opts out.
-            // Template, identity, model and runtime bootstrap still use the same durable funnel.
+            // Omission preserves the default initialization turn.
             request.default_initial_message.unwrap_or(true),
         )
         .await
         .map_err(error_response)?;
+    finish_agent_creation(&state, &agent_id, request.authority_class, created).await
+}
+
+pub async fn create_restricted_agent(
+    Path(agent_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(request): ApiJson<CreateRestrictedAgentRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    authorize_control(&headers, &state).map_err(authentication_error_response)?;
+    let expected_policy = request.tool_allowlist;
+    let created = state
+        .host
+        .create_restricted_agent(
+            &agent_id,
+            request.template,
+            request.name,
+            request.default_initial_message.unwrap_or(true),
+            expected_policy.clone(),
+        )
+        .await
+        .map_err(error_response)?;
+    let applied = crate::tool::restricted::load(
+        state.host.runtime_db(),
+        &agent_id,
+        created.identity.incarnation,
+    )
+    .map_err(error_response)?;
+    if applied.as_ref() != Some(&expected_policy) {
+        return Err(error_response(anyhow::anyhow!(
+            "restricted agent policy readback failed"
+        )));
+    }
+    let (status, Json(mut response)) =
+        finish_agent_creation(&state, &agent_id, request.authority_class, created).await?;
+    response["tool_allowlist_applied"] = json!(true);
+    Ok((status, Json(response)))
+}
+
+async fn finish_agent_creation(
+    state: &Arc<AppState>,
+    agent_id: &str,
+    provided_trust: Option<AuthorityClass>,
+    mut created: crate::types::AgentCreateResult,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let admission_context = control_admission_context(state);
     // Attach a job projection to the background bootstrap so clients can poll
     // progress; the durable bootstrap record stays the source of truth.
     let mut status = StatusCode::OK;
     if created.receipt.stage == crate::types::AgentCreateStage::Provisioning {
         status = StatusCode::ACCEPTED;
         if let Ok(crate::host::AgentBootstrapKick::Started(receiver)) =
-            state.host.kick_agent_bootstrap(&agent_id)
+            state.host.kick_agent_bootstrap(agent_id)
         {
             created.receipt.job_id = Some(super::jobs::spawn_agent_bootstrap_job(
-                &state, &agent_id, receiver,
+                state, agent_id, receiver,
             ));
         }
     }
@@ -1265,7 +1316,7 @@ pub async fn create_agent(
     );
     if let Err(error) = state
         .host
-        .append_agent_creation_audit(&agent_id, created.identity.incarnation, audit)
+        .append_agent_creation_audit(agent_id, created.identity.incarnation, audit)
         .await
     {
         tracing::warn!(
@@ -1274,7 +1325,9 @@ pub async fn create_agent(
             "agent core commit succeeded but agent_created audit append failed"
         );
     }
-    Ok((status, Json(created)))
+    let response = serde_json::to_value(&created)
+        .map_err(|_| error_response(anyhow::anyhow!("create response unavailable")))?;
+    Ok((status, Json(response)))
 }
 
 pub async fn agent_detail(

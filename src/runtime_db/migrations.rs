@@ -4403,6 +4403,8 @@ CREATE INDEX IF NOT EXISTS idx_episode_memory_results_episode_scope
         sql: "",
     },
     Migration { version: 107, name: "service_managed_timer_deliveries", sql: super::managed_timers::SCHEMA },
+    Migration { version: 108, name: "restricted_agent_tool_allowlist", sql: crate::tool::restricted::SCHEMA },
+    Migration { version: 109, name: "operator_prompt_cancellations", sql: super::operator_prompt_cancel::SCHEMA },
 ];
 
 pub(crate) fn ensure_migration_table(connection: &Connection) -> Result<()> {

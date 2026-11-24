@@ -117,3 +117,27 @@ async function readBody(response: Response): Promise<unknown> {
     return text;
   }
 }
+
+/** Relative to the API mount (typically `/api`). */
+export const restrictedAgentCapabilitiesPath = "/control/runtime/restricted-agent-capabilities";
+
+export function restrictedAgentCreatePath(encodedAgentId: string): string {
+  return `/control/agents/${encodedAgentId}/restricted/create`;
+}
+
+export interface RestrictedToolSpec {
+  readonly name: string;
+  readonly description: string;
+  readonly parameters: Readonly<Record<string, unknown>>;
+}
+
+export interface RestrictedToolBridge {
+  readonly url: string;
+  readonly bearer: string;
+}
+
+export interface RestrictedToolAllowlist {
+  readonly tool_name_prefix: string;
+  readonly tools: readonly RestrictedToolSpec[];
+  readonly bridge: RestrictedToolBridge;
+}

@@ -90,6 +90,7 @@ const FIXED_DELETE_GUARDS: &[(&str, &str, &str)] = &[
 // Child/derived rows precede source rows. Optional memory tables share this DB.
 // Jointly owned records (reports, delegations, workspaces) are not in this list.
 const PRIVATE_TABLES: &[(&str, &str)] = &[
+    ("restricted_agent_tool_settings", "agent_id"),
     // Domain projections are private content, not retained identity fences.
     ("current_read_qualification", "agent_id"),
     ("current_read_revisions", "agent_id"),
@@ -600,6 +601,7 @@ pub(crate) fn export_private_history(
         assert_search_schema_tx(tx)?;
         let mut tables = serde_json::Map::new();
         for (table, predicate) in private_history_selections_tx(tx)? {
+            if table == "restricted_agent_tool_settings" { continue; }
             let mut statement = tx.prepare(&format!(
                 "SELECT * FROM {} WHERE {predicate}",
                 quoted(table)

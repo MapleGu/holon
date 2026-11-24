@@ -1092,6 +1092,7 @@ async fn prepared_domains_survive_active_metadata_only_for_the_current_incarnati
     {
         let timestamp = chrono::DateTime::from_timestamp(1, 0).unwrap();
         let identity = AgentIdentityRecord {
+            tool_allowlist_required: false,
             agent_id: "default".into(),
             name: None,
             kind: AgentKind::Default,
@@ -1134,6 +1135,7 @@ fn episode_identity(incarnation: u64, status: AgentRegistryStatus) -> Arc<AgentI
     use crate::types::{AgentKind, AgentVisibility};
     let timestamp = chrono::DateTime::from_timestamp(1, 0).unwrap();
     Arc::new(AgentIdentityRecord {
+        tool_allowlist_required: false,
         agent_id: "default".into(),
         name: None,
         kind: AgentKind::Default,

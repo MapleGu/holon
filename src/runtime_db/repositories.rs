@@ -1043,6 +1043,7 @@ impl AgentIdentityRepository<'_> {
                 identity.agent_id
             );
             upsert_agent_identity_tx(tx, identity)?;
+            crate::tool::restricted::persist(tx, identity, bootstrap.desired.tool_allowlist.as_ref())?;
             upsert_agent_bootstrap_tx(
                 tx,
                 &bootstrap.clone().for_incarnation(identity.incarnation),
@@ -1197,6 +1198,7 @@ impl AgentIdentityRepository<'_> {
                 "DELETE FROM agent_supervisions WHERE child_agent_id = ?1",
                 params![agent_id],
             )?;
+            crate::tool::restricted::persist(tx, &identity, bootstrap.desired.tool_allowlist.as_ref())?;
             upsert_agent_bootstrap_tx(tx, &bootstrap.for_incarnation(identity.incarnation))?;
             upsert_canonical_record_set_tx(tx, &relations)?;
             let scope = crate::runtime::resident_input_evidence::InputEvidenceScope {
