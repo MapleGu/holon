@@ -251,6 +251,15 @@ impl RuntimeHandle {
         #[cfg(all(test, holon_lib_test_shard = "d"))]
         self.check_operator_dispatch_reader_failure(false)?;
         let mut model_selection = TurnModelSelection::from_message(message)?;
+        model_selection.caller_retries_provider_failure = message.kind == MessageKind::OperatorPrompt
+            && message.delivery_surface == Some(MessageDeliverySurface::HttpControlPrompt)
+            && message.work_item_id.is_none()
+            && operator_binding_id.is_none()
+            && operator_reply_route_id.is_none()
+            && self
+                .restricted_tool_allowlist()
+                .await?
+                .is_some_and(|policy| policy.structured_output_only());
         let provider_admission = self.active_provider_admission()?;
         model_selection.admitted_model = provider_admission
             .as_ref()
@@ -441,6 +450,12 @@ impl RuntimeHandle {
             {
                 outcome.terminal.no_brief_reason = Some(TurnNoBriefReason::ToolOnlyWait);
             }
+        } else if outcome.terminal_kind == TurnTerminalKind::ProviderFailed {
+            // Preserve the standalone caller-owned terminal without creating a delivery obligation.
+            anyhow::ensure!(
+                outcome.terminal.no_brief_reason == Some(TurnNoBriefReason::StructuredOutputOnly),
+                "caller-owned provider failure has no structured terminal reason"
+            );
         } else if outcome.terminal_kind == TurnTerminalKind::Completed
             && message.kind == MessageKind::OperatorPrompt
             && message.delivery_surface == Some(MessageDeliverySurface::HttpControlPrompt)

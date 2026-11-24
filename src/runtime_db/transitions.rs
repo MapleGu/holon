@@ -11792,10 +11792,12 @@ fn settle_released_http_turn_tx(
         .ok_or_else(|| anyhow::anyhow!("released HTTP turn is not terminal"))?;
     if terminal.no_brief_reason == Some(crate::types::TurnNoBriefReason::StructuredOutputOnly) {
         anyhow::ensure!(
-            terminal.kind == TurnTerminalKind::Completed
+            matches!(terminal.kind, TurnTerminalKind::Completed | TurnTerminalKind::ProviderFailed)
                 && turn.current_work_item_id.is_none()
+                && (terminal.kind != TurnTerminalKind::ProviderFailed
+                    || original.current_work_item_id.is_none())
                 && turn.produced_brief_ids.is_empty(),
-            "only standalone structured success may omit its Brief"
+            "only a standalone structured terminal may omit its Brief"
         );
         return Ok(());
     }

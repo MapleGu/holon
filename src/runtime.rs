@@ -5615,6 +5615,7 @@ impl RuntimeHandle {
                 TurnTerminalKind::Completed,
                 Some(TurnNoBriefReason::ToolOnlyWait | TurnNoBriefReason::StructuredOutputOnly),
             ) => true,
+            (TurnTerminalKind::ProviderFailed, Some(TurnNoBriefReason::StructuredOutputOnly)) => true,
             (TurnTerminalKind::Aborted, Some(TurnNoBriefReason::Aborted)) => true,
             (TurnTerminalKind::Interrupted, Some(TurnNoBriefReason::Interrupted)) => true,
             _ => false,
@@ -5949,7 +5950,7 @@ impl RuntimeHandle {
             && prepared_wait.is_none()
             && provider_pause.is_none()
             && terminal_transition.is_some_and(|transition| {
-                matches!(transition.terminal.kind, TurnTerminalKind::Completed | TurnTerminalKind::BaselineOverBudget | TurnTerminalKind::ProviderFailedNeedsRecovery)
+                matches!(transition.terminal.kind, TurnTerminalKind::Completed | TurnTerminalKind::BaselineOverBudget | TurnTerminalKind::ProviderFailedNeedsRecovery | TurnTerminalKind::ProviderFailed)
                     && transition.provider_recovery_message.is_none()
             })
             && self.restricted_tool_allowlist().await?

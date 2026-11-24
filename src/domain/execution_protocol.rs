@@ -1605,7 +1605,7 @@ pub fn recover_unadvanced_task_result_claim(
     Ok(transition)
 }
 
-fn validate_outcome_binding(
+pub(crate) fn validate_outcome_binding(
     binding: &ExecutionBinding,
     outcome: &ExecutionOutcome,
 ) -> Result<(), String> {

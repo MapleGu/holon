@@ -143,6 +143,7 @@ pub(super) fn derive_closure_decision(facts: ClosureFacts) -> anyhow::Result<Clo
                 TurnTerminalKind::ProviderFailedNeedsRecovery => {
                     "turn_terminal_provider_failed_needs_recovery"
                 }
+                TurnTerminalKind::ProviderFailed => "turn_terminal_provider_failed",
                 TurnTerminalKind::Completed => unreachable!("completed is not a failure"),
             };
             push_evidence(&mut evidence, format_args!("{}", marker))?;

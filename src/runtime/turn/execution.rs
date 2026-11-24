@@ -293,7 +293,7 @@ impl TurnModelSelection {
             })?;
         Ok(Self {
             recovery: Some(directive),
-            admitted_model: None,
+            ..Self::default()
         })
     }
 }
@@ -558,6 +558,56 @@ impl RuntimeHandle {
             provider_recovery_message: None,
             terminal_tool_executions: vec![pending.tool_execution.clone()],
         })
+    }
+
+    async fn maybe_finish_caller_owned_provider_failure(
+        &self,
+        caller_retries: bool,
+        error: &anyhow::Error,
+        duration_ms: u64,
+        persist_terminal: bool,
+    ) -> Result<Option<AgentLoopOutcome>> {
+        if !caller_retries || provider_attempt_timeline(error).is_none() {
+            return Ok(None);
+        }
+        {
+            let guard = self.inner.agent.lock().await;
+            let state = &guard.state;
+            if state.current_work_item_id.is_some()
+                || state.current_turn_work_item_id.is_some()
+                || !state.current_execution_binding.as_ref().is_some_and(|binding| {
+                    binding.work_item_id.is_none()
+                        && matches!(binding.owner, Some(crate::types::TurnOwner::Conversation { .. }))
+                })
+            {
+                return Ok(None);
+            }
+        }
+        let terminal = self
+            .persist_turn_terminal_record(
+                TurnTerminalKind::ProviderFailed,
+                None,
+                Some(TurnNoBriefReason::StructuredOutputOnly),
+                duration_ms,
+                None,
+                persist_terminal,
+            )
+            .await?;
+        Ok(Some(AgentLoopOutcome {
+            final_text: String::new(),
+            final_citations: Vec::new(),
+            final_text_source_assistant_round_id: None,
+            turn_index: terminal.turn_index,
+            terminal,
+            should_sleep: false,
+            sleep_duration_ms: None,
+            allow_sleep_runnable_work_override: false,
+            terminal_kind: TurnTerminalKind::ProviderFailed,
+            prepared_work_item_completion: None,
+            prepared_wait_for: None,
+            provider_recovery_message: None,
+            terminal_tool_executions: Vec::new(),
+        }))
     }
 
     pub(in crate::runtime) async fn maybe_defer_provider_lineage_failure(
@@ -4784,6 +4834,7 @@ impl<'a> TurnExecution<'a> {
         let mut context_length_recovery_attempts = 0usize;
         let decision_tool_calls = Arc::new(AtomicUsize::new(0));
         let provider_recovery = model_selection.recovery.clone();
+        let caller_retries_provider_failure = model_selection.caller_retries_provider_failure;
         let mut checkpoint_state = {
             let guard = runtime.inner.agent.lock().await;
             checkpoint_state_from_last_terminal(guard.state.last_turn_terminal.as_ref())
@@ -5255,6 +5306,17 @@ impl<'a> TurnExecution<'a> {
                                 .maybe_handle_context_length_exceeded(
                                     agent_id,
                                     round,
+                                    &err,
+                                    turn_started_at.elapsed().as_millis() as u64,
+                                    persist_terminal,
+                                )
+                                .await?
+                            {
+                                return Ok(ProviderRoundResult::Terminal(outcome));
+                            }
+                            if let Some(outcome) = runtime
+                                .maybe_finish_caller_owned_provider_failure(
+                                    caller_retries_provider_failure,
                                     &err,
                                     turn_started_at.elapsed().as_millis() as u64,
                                     persist_terminal,
@@ -5736,6 +5798,17 @@ impl<'a> TurnExecution<'a> {
                                 .maybe_handle_context_length_exceeded(
                                     agent_id,
                                     round,
+                                    &err,
+                                    turn_started_at.elapsed().as_millis() as u64,
+                                    persist_terminal,
+                                )
+                                .await?
+                            {
+                                return Ok(ProviderRoundResult::Terminal(outcome));
+                            }
+                            if let Some(outcome) = runtime
+                                .maybe_finish_caller_owned_provider_failure(
+                                    caller_retries_provider_failure,
                                     &err,
                                     turn_started_at.elapsed().as_millis() as u64,
                                     persist_terminal,

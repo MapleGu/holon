@@ -58,6 +58,7 @@ fn terminal_kind_str(kind: TurnTerminalKind) -> &'static str {
         TurnTerminalKind::BaselineOverBudget => "baseline_over_budget",
         TurnTerminalKind::DeferredToFallback => "deferred_to_fallback",
         TurnTerminalKind::ProviderFailedNeedsRecovery => "provider_failed_needs_recovery",
+        TurnTerminalKind::ProviderFailed => "provider_failed",
     }
 }
 

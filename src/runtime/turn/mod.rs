@@ -132,6 +132,7 @@ pub(super) struct ProviderRecoveryDirective {
 pub(crate) struct TurnModelSelection {
     pub(super) recovery: Option<ProviderRecoveryDirective>,
     pub(super) admitted_model: Option<ModelRouteRef>,
+    pub(super) caller_retries_provider_failure: bool,
 }
 
 impl TurnModelSelection {

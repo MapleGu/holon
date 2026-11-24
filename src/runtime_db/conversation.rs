@@ -16,7 +16,7 @@ use crate::domain::conversation::{
     ConversationShadowMismatchKind, ConversationSummaryPage, ConversationTurnSummary,
     CursorBinding, CursorCodec, CursorDecodeError, DetailCoverage, DetailCoverageReason,
     DetailCursor, ExecutionState, HistoryCursor, PendingInput, PendingInputState,
-    PresentationClass, StreamCursor, TerminalOutcome, TurnInputSummary, TurnKey,
+    PresentationClass, StreamCursor, TurnInputSummary, TurnKey,
     CONVERSATION_QUERY_VERSION, CONVERSATION_SCHEMA_VERSION,
 };
 use crate::runtime_db::types::ConversationRepository;
@@ -2303,9 +2303,9 @@ fn attention(connection: &Connection, record: &TurnRecord) -> Result<Option<Atte
     if let Some(terminal) = record.terminal.as_ref() {
         return Ok(match terminal.kind {
             TurnTerminalKind::Completed => None,
-            TurnTerminalKind::BaselineOverBudget => Some(Attention::Failed {
-                outcome: TerminalOutcome::BaselineOverBudget,
-            }),
+            TurnTerminalKind::BaselineOverBudget | TurnTerminalKind::ProviderFailed => {
+                Some(Attention::Failed { outcome: terminal.kind.into() })
+            }
             TurnTerminalKind::Aborted
             | TurnTerminalKind::Interrupted
             | TurnTerminalKind::DeferredToFallback

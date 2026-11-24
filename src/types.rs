@@ -2430,6 +2430,7 @@ pub enum TurnTerminalKind {
     BaselineOverBudget,
     DeferredToFallback,
     ProviderFailedNeedsRecovery,
+    ProviderFailed,
 }
 
 impl TurnTerminalKind {

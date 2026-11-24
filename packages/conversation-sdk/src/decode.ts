@@ -44,6 +44,7 @@ const terminalOutcomes = new Set<TerminalOutcome>([
   "baseline_over_budget",
   "deferred_to_fallback",
   "provider_failed_needs_recovery",
+  "provider_failed",
 ]);
 const resultUnavailableReasons = new Set<ResultUnavailableReason>([
   "missing_canonical_linkage",

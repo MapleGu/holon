@@ -923,3 +923,108 @@ async fn issue160_standalone_timer_prompt_settles_without_brief() {
     server.await.unwrap();
     host.shutdown().await.unwrap();
 }
+
+struct FailingStructuredProvider(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl crate::provider::AgentProvider for FailingStructuredProvider {
+    async fn complete_turn(
+        &self,
+        request: crate::provider::ProviderTurnRequest,
+    ) -> anyhow::Result<crate::provider::ProviderTurnResponse> {
+        if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            use crate::provider::{provider_turn_error, ProviderAttemptTimeline};
+            return Err(provider_turn_error(
+                "synthetic malformed provider response",
+                ProviderAttemptTimeline {
+                    attempts: vec![],
+                    requested_model_ref: "stub".into(),
+                    active_model_ref: None,
+                    winning_model_ref: None,
+                    pending_fallback_model_ref: Some("openai@default/synthetic-fallback".into()),
+                    pending_fallback_disposition: None,
+                    aggregated_token_usage: None,
+                },
+                anyhow::anyhow!("synthetic malformed provider response"),
+            ));
+        }
+        crate::provider::StubProvider::new("synthetic retry completed")
+            .complete_turn(request)
+            .await
+    }
+
+    fn configured_model_refs(&self) -> Vec<String> {
+        vec!["stub".into()]
+    }
+}
+
+#[tokio::test]
+async fn structured_provider_failure_settles_and_reclaims_exact_agent() {
+    use crate::types::{AgentDeletionStatus, AgentRegistryStatus};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (_home, initial) = tests::control_token_test_host();
+    let mut config = initial.config().as_ref().clone();
+    config.default_agent_id = "synthetic-default-anchor".into();
+    initial.shutdown().await.unwrap();
+    drop(initial);
+    let provider = Arc::new(FailingStructuredProvider(AtomicUsize::new(0)));
+    let host = RuntimeHost::new_with_provider(config, provider.clone()).unwrap();
+    let policy: crate::tool::restricted::ToolAllowlist = serde_json::from_value(json!({
+        "structured_output_only": true, "tool_name_prefix": "fixture_", "tools": [],
+        "bridge": {"url":"http://127.0.0.1:9/call", "bearer":"synthetic-unused-bridge"}
+    })).unwrap();
+    host.create_restricted_agent("synthetic-default-anchor", None, None, false, policy.clone())
+        .await.unwrap();
+    let (base, stop, server) = serve_follow_up_http(host.clone()).await;
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().unwrap();
+
+    {
+        let agent = "synthetic-http-source";
+        let created = host.create_restricted_agent(agent, None, None, false, policy.clone()).await.unwrap();
+        let incarnation = created.identity.incarnation;
+        let receipt = follow_up_http_json(&client, &base, "POST", &format!("/control/agents/{agent}/prompt"), None,
+            Some(json!({"text":"Synthetic structured input", "expected_incarnation":incarnation,
+                "client_request_id":"synthetic-provider-failure-attempt"}))).await;
+        let message = receipt["message_id"].as_str().unwrap();
+        let turn = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let located = client.post(format!("{base}/agents/{agent}/conversation/locate"))
+                    .bearer_auth("secret").header("x-holon-expected-incarnation", incarnation)
+                    .json(&json!({"source_ref":format!("message:{message}")}))
+                    .send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap();
+                if let Some(turn) = located["window"]["turns"].as_array().and_then(|turns| {
+                    turns.iter().find(|turn| turn["turn_id"] == located["target"]["turn_id"]
+                        && turn["execution"]["kind"] == "terminal" && turn["settled"] == true)
+                }) {
+                    assert_eq!(located["target"]["message_id"], message);
+                    break turn.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(turn["execution"]["outcome"], "provider_failed");
+        assert_eq!(turn["result"]["reason"]["kind"], "structured_output_only");
+        let state = host.agent_storage(agent).unwrap().read_agent().unwrap().unwrap();
+        assert!(state.current_turn_id.is_none());
+        assert!(state.current_execution_binding.is_none());
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+
+        host.stop_public_agent_if_incarnation(agent, incarnation).await.unwrap();
+        let (_, job, created) = host.begin_public_agent_deletion_if_incarnation(
+            agent, false, "synthetic test", true, Some(incarnation),
+        ).await.unwrap();
+        assert!(created);
+        host.execute_deletion_job(job.clone()).await.unwrap();
+        let (retired, completed) = host.public_agent_deletion_status(agent).unwrap();
+        assert_eq!(retired.status, AgentRegistryStatus::Deleted);
+        assert_eq!(retired.incarnation, incarnation);
+        let completed = completed.unwrap();
+        assert_eq!(completed.deletion_id, job.deletion_id);
+        assert_eq!(completed.status, AgentDeletionStatus::Completed);
+        assert!(completed.archive_path.unwrap().is_file());
+    }
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    host.shutdown().await.unwrap();
+}

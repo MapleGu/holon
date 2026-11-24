@@ -7,7 +7,11 @@ use anyhow::{Result, bail};
 use chrono::Utc;
 use rusqlite::{OptionalExtension, Transaction};
 
-use crate::types::{AgentState, AgentStatus};
+use crate::domain::execution_protocol::{
+    ExecutionAttempt, ExecutionAttemptState, ExecutionBinding, ExecutionOutcomeRecord,
+    validate_outcome_binding,
+};
+use crate::types::{AgentState, AgentStatus, ExecutionAdmissionProvenance, TurnOwner};
 
 /// Existing operator/one-shot deletion retains its cancellation semantics.
 /// Parent cleanup closes new admission without cancelling accepted work.
@@ -53,14 +57,38 @@ pub(crate) fn ensure_root_admission_tx(tx: &Transaction<'_>, root_id: &str) -> R
 /// Durable state that proves live execution or scheduling. These block both
 /// deletion admission and reminder delivery because the agent is not idle.
 const EXECUTION_BLOCKER_CHECKS: &[(&str, &str)] = &[
-    ("active_task", "SELECT EXISTS(SELECT 1 FROM tasks WHERE owner_agent_id = ?1 AND status IN ('queued','running','cancelling'))"),
-    ("inbound_invocation", "SELECT EXISTS(SELECT 1 FROM tasks WHERE child_agent_id = ?1 AND status IN ('queued','running','cancelling'))"),
-    ("queued_or_claimed_input", "SELECT EXISTS(SELECT 1 FROM queue_entries WHERE agent_id = ?1 AND status IN ('queued','dequeued','interrupted'))"),
-    ("accepted_delivery", "SELECT EXISTS(SELECT 1 FROM agent_message_deliveries WHERE target_agent_id = ?1 AND state IN ('queued','dispatched'))"),
-    ("wait", "SELECT EXISTS(SELECT 1 FROM wait_conditions WHERE agent_id = ?1 AND status IN ('active','triggered'))"),
-    ("pending_result_settlement", "SELECT EXISTS(SELECT 1 FROM task_result_settlements WHERE agent_id = ?1 AND state != 'settled')"),
-    ("open_execution", "SELECT EXISTS(SELECT 1 FROM execution_protocol_attempts WHERE agent_id = ?1 AND lifecycle_state = 'open')"),
-    ("workspace_occupancy", "SELECT EXISTS(SELECT 1 FROM workspace_occupancies WHERE holder_agent_id = ?1 AND released_at IS NULL)"),
+    (
+        "active_task",
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE owner_agent_id = ?1 AND status IN ('queued','running','cancelling'))",
+    ),
+    (
+        "inbound_invocation",
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE child_agent_id = ?1 AND status IN ('queued','running','cancelling'))",
+    ),
+    (
+        "queued_or_claimed_input",
+        "SELECT EXISTS(SELECT 1 FROM queue_entries WHERE agent_id = ?1 AND status IN ('queued','dequeued','interrupted'))",
+    ),
+    (
+        "accepted_delivery",
+        "SELECT EXISTS(SELECT 1 FROM agent_message_deliveries WHERE target_agent_id = ?1 AND state IN ('queued','dispatched'))",
+    ),
+    (
+        "wait",
+        "SELECT EXISTS(SELECT 1 FROM wait_conditions WHERE agent_id = ?1 AND status IN ('active','triggered'))",
+    ),
+    (
+        "pending_result_settlement",
+        "SELECT EXISTS(SELECT 1 FROM task_result_settlements WHERE agent_id = ?1 AND state != 'settled')",
+    ),
+    (
+        "open_execution",
+        "SELECT EXISTS(SELECT 1 FROM execution_protocol_attempts WHERE agent_id = ?1 AND lifecycle_state = 'open')",
+    ),
+    (
+        "workspace_occupancy",
+        "SELECT EXISTS(SELECT 1 FROM workspace_occupancies WHERE holder_agent_id = ?1 AND released_at IS NULL)",
+    ),
 ];
 
 const UNFINISHED_WORK_CHECK: (&str, &str) = (
@@ -165,10 +193,127 @@ pub(crate) fn conditional_delete_blocker_tx(
     if let Some(blocker) = first_blocker_tx(tx, &state.id, EXECUTION_BLOCKER_CHECKS)? {
         return Ok(Some(blocker));
     }
+    if !terminal_execution_references_tx(tx, state)? {
+        return Ok(Some("unverified_execution_references".into()));
+    }
     if let Some(blocker) = first_blocker_tx(tx, &state.id, &[UNFINISHED_WORK_CHECK])? {
         return Ok(Some(blocker));
     }
     reclamation_timer_blocker_tx(tx, &state.id)
+}
+
+// Older terminal turns can leave execution references behind. A conditional
+// delete may archive those only when the same write transaction proves their
+// ownership and terminality. Conversation result delivery is a separate fact.
+fn terminal_execution_references_tx(tx: &Transaction<'_>, state: &AgentState) -> Result<bool> {
+    let Some(turn_id) = state.current_turn_id.as_deref() else {
+        return Ok(
+            state.current_execution_binding.is_none() && state.current_turn_work_item_id.is_none()
+        );
+    };
+    let turn_payload: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM turn_records WHERE agent_id=?1 AND turn_id=?2",
+            rusqlite::params![state.id, turn_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(turn_payload) = turn_payload else {
+        return Ok(false);
+    };
+    let turn = super::repositories::decode_turn_record_payload(&turn_payload)?;
+    if turn.agent_id != state.id
+        || turn.turn_id != turn_id
+        || turn.turn_index != state.turn_index
+        || turn.current_work_item_id != state.current_turn_work_item_id
+        || !turn.terminal.as_ref().is_some_and(|terminal| {
+            state.last_turn_terminal.as_ref().is_some_and(|last| {
+                last.turn_id == turn_id
+                    && last.turn_index == turn.turn_index
+                    && last.kind == terminal.kind
+            })
+        })
+    {
+        return Ok(false);
+    }
+    let Some(binding) = &state.current_execution_binding else {
+        return Ok(true);
+    };
+    let Some(activation_id) = &binding.activation_id else {
+        return Ok(false);
+    };
+    if matches!(binding.admission_provenance.as_ref(),
+        Some(ExecutionAdmissionProvenance::Canonical { activation_id: admitted, .. })
+            if admitted != activation_id)
+        || binding.turn_id != turn_id
+        || binding.owner != turn.owner
+        || binding.work_item_id != turn.current_work_item_id
+        || !turn.input_message_ids.contains(&binding.source_message_id)
+        || turn
+            .trigger
+            .as_ref()
+            .and_then(|trigger| trigger.message_id.as_ref())
+            != Some(&binding.source_message_id)
+    {
+        return Ok(false);
+    }
+    let evidence: Option<(String, String)> = tx
+        .query_row(
+            "SELECT attempt.payload_json, outcome.payload_json FROM execution_protocol_attempts attempt
+         JOIN execution_protocol_outcomes outcome
+           ON outcome.agent_id=attempt.agent_id AND outcome.attempt_id=attempt.attempt_id
+           AND outcome.outcome_id=attempt.terminal_outcome_id
+         WHERE attempt.agent_id=?1 AND attempt.attempt_id=?2
+           AND attempt.lifecycle_state IN ('settled','interrupted')",
+            rusqlite::params![state.id, activation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((attempt_payload, outcome_payload)) = evidence else {
+        return Ok(false);
+    };
+    let attempt: ExecutionAttempt = serde_json::from_str(&attempt_payload)?;
+    let outcome: ExecutionOutcomeRecord = serde_json::from_str(&outcome_payload)?;
+    let owner_matches = match (&binding.owner, &attempt.binding) {
+        (
+            Some(TurnOwner::Conversation { interaction_id }),
+            ExecutionBinding::Conversation {
+                interaction_id: admitted,
+            },
+        ) => interaction_id == admitted,
+        (
+            Some(TurnOwner::WorkItem { work_item_id }),
+            ExecutionBinding::WorkItem {
+                work_item_id: admitted,
+            },
+        ) => work_item_id == admitted,
+        (
+            Some(TurnOwner::AgentLifecycle { agent_id }),
+            ExecutionBinding::AgentLifecycle { agent_id: admitted },
+        ) => agent_id == admitted,
+        (Some(TurnOwner::Command), ExecutionBinding::Command) => true,
+        _ => false,
+    };
+    Ok(owner_matches
+        && attempt.agent_id == state.id
+        && attempt.attempt_id == *activation_id
+        && attempt
+            .turn_id
+            .as_deref()
+            .is_none_or(|admitted_turn| admitted_turn == turn_id)
+        && attempt
+            .run_id
+            .as_ref()
+            .is_none_or(|admitted_run| Some(admitted_run) == turn.run_id.as_ref())
+        && attempt.source_message_id.as_ref() == Some(&binding.source_message_id)
+        && matches!(
+            attempt.state,
+            ExecutionAttemptState::Settled | ExecutionAttemptState::Interrupted
+        )
+        && outcome.attempt_id == attempt.attempt_id
+        && attempt.terminal_outcome_id.as_ref() == Some(&outcome.outcome_id)
+        && validate_outcome_binding(&attempt.binding, &outcome.outcome).is_ok()
+        && attempt.terminal_at.is_some())
 }
 
 /// Operator reclamation must preserve scheduled work and deliveries,
@@ -181,10 +326,22 @@ pub(crate) fn reclamation_timer_blocker_tx(
         tx,
         agent_id,
         &[
-            ("timer", "SELECT EXISTS(SELECT 1 FROM timers WHERE agent_id = ?1 AND status NOT IN ('completed','cancelled'))"),
-            ("timer_wake", "SELECT EXISTS(SELECT 1 FROM timers t JOIN timer_wakes w USING(timer_id) WHERE t.agent_id = ?1 AND w.status NOT IN ('incorporated','cancelled'))"),
-            ("managed_timer_delivery", "SELECT EXISTS(SELECT 1 FROM managed_timers m JOIN managed_timer_deliveries d USING(timer_id) WHERE m.agent_id = ?1 AND d.status NOT IN ('acknowledged','cancelled'))"),
-            ("managed_timer_missing", "SELECT EXISTS(SELECT 1 FROM managed_timers m LEFT JOIN timers t USING(timer_id) WHERE m.agent_id = ?1 AND (t.timer_id IS NULL OR t.agent_id != m.agent_id))"),
+            (
+                "timer",
+                "SELECT EXISTS(SELECT 1 FROM timers WHERE agent_id = ?1 AND status NOT IN ('completed','cancelled'))",
+            ),
+            (
+                "timer_wake",
+                "SELECT EXISTS(SELECT 1 FROM timers t JOIN timer_wakes w USING(timer_id) WHERE t.agent_id = ?1 AND w.status NOT IN ('incorporated','cancelled'))",
+            ),
+            (
+                "managed_timer_delivery",
+                "SELECT EXISTS(SELECT 1 FROM managed_timers m JOIN managed_timer_deliveries d USING(timer_id) WHERE m.agent_id = ?1 AND d.status NOT IN ('acknowledged','cancelled'))",
+            ),
+            (
+                "managed_timer_missing",
+                "SELECT EXISTS(SELECT 1 FROM managed_timers m LEFT JOIN timers t USING(timer_id) WHERE m.agent_id = ?1 AND (t.timer_id IS NULL OR t.agent_id != m.agent_id))",
+            ),
         ],
     )
 }
@@ -202,10 +359,18 @@ pub(crate) fn parent_cleanup_blocker_tx(
         return Ok(Some(blocker));
     }
     for (reason, sql) in [
-        ("descendant_responsibility", "SELECT EXISTS(SELECT 1 FROM agent_supervisions WHERE supervisor_agent_id = ?1 AND state != 'closed')"),
-        ("protected_artifact", "SELECT EXISTS(SELECT 1 FROM artifact_metadata WHERE agent_id = ?1)"),
+        (
+            "descendant_responsibility",
+            "SELECT EXISTS(SELECT 1 FROM agent_supervisions WHERE supervisor_agent_id = ?1 AND state != 'closed')",
+        ),
+        (
+            "protected_artifact",
+            "SELECT EXISTS(SELECT 1 FROM artifact_metadata WHERE agent_id = ?1)",
+        ),
     ] {
-        if tx.query_row(sql, [agent_id], |row| row.get::<_, bool>(0))? { return Ok(Some(reason.into())); }
+        if tx.query_row(sql, [agent_id], |row| row.get::<_, bool>(0))? {
+            return Ok(Some(reason.into()));
+        }
     }
     Ok(None)
 }
@@ -398,6 +563,128 @@ mod tests {
         let replay = db.messages().append_with_index_changes(&message, &[])?;
         assert_eq!(replay.message_seq, stored.message_seq);
         assert_eq!(evidence()?, after);
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_delete_requires_exact_terminal_execution_references() -> Result<()> {
+        use crate::types::{
+            MessageEnvelope, TurnRecord, TurnTriggerSummary, WorkItemExecutionBinding,
+        };
+        let (_dir, db) = open_db();
+        let agent = "synthetic-historical";
+        let mut state = settled(agent, AgentStatus::Asleep, TurnTerminalKind::Completed);
+        state.turn_index = 1;
+        state.current_turn_id = Some("turn-1".into());
+        let owner = TurnOwner::Conversation {
+            interaction_id: "synthetic-conversation".into(),
+        };
+        let source = MessageEnvelope::new(
+            agent,
+            crate::types::MessageKind::InternalFollowup,
+            crate::types::MessageOrigin::System {
+                subsystem: "synthetic".into(),
+            },
+            crate::types::AuthorityClass::RuntimeInstruction,
+            crate::types::Priority::Next,
+            crate::types::MessageBody::Text {
+                text: "synthetic".into(),
+            },
+        );
+        state.current_execution_binding = Some(WorkItemExecutionBinding {
+            activation_id: Some("attempt".into()),
+            admission_provenance: None,
+            source_message_id: source.id.clone(),
+            turn_id: "turn-1".into(),
+            owner: Some(owner.clone()),
+            work_item_id: None,
+            claimed_work_revision: None,
+        });
+        let check =
+            |state: &AgentState| db.transaction(|tx| conditional_delete_blocker_tx(tx, state));
+        let blocked = Some("unverified_execution_references".into());
+        assert_eq!(check(&state)?, blocked);
+        let mut turn = TurnRecord::new(agent, "turn-1", 1);
+        turn.owner = Some(owner);
+        turn.trigger = Some(TurnTriggerSummary::from_message(&source));
+        turn.input_message_ids.push(source.id.clone());
+        db.messages().append_with_index_changes(&source, &[])?;
+        db.turn_records().upsert(&turn)?;
+        assert_eq!(check(&state)?, blocked);
+        turn.terminal = Some(crate::types::TurnTerminalSummary::from_terminal(
+            &terminal_record(TurnTerminalKind::Completed),
+        ));
+        db.turn_records().upsert(&turn)?;
+        assert_eq!(check(&state)?, blocked);
+        let payload = serde_json::json!({
+            "agent_id": agent, "attempt_id":"attempt", "source_message_id":source.id,
+            "source":{"identity":{"kind":"internal_followup","message_id":source.id},"generation":1},
+            "binding":turn.owner,"provenance":{"origin":"runtime_recovery","trust":"runtime_instruction","priority":"next"},
+            "admitted_fences":{"source_revision":1,"agent_control_revision":1,"host_registry_revision":1},
+            "state":"settled","recovery_of_attempt_id":"prior","terminal_outcome_id":"outcome",
+            "admitted_at":"2040-01-01T00:00:00Z","terminal_at":"2040-01-01T00:00:01Z"
+        });
+        let outcome = serde_json::json!({
+            "outcome_id":"outcome","attempt_id":"attempt",
+            "outcome":{"owner":"conversation","outcome":{"kind":"replied"}},
+            "created_at":"2040-01-01T00:00:01Z"
+        });
+        db.transaction(|tx| {
+            tx.execute("INSERT INTO execution_protocol_attempts VALUES(?1,'attempt','settled','{}',1,'prior','outcome',?2)",
+                rusqlite::params![agent, payload.to_string()])?;
+            tx.execute("INSERT INTO execution_protocol_outcomes VALUES(?1,'outcome','attempt',?2)",
+                rusqlite::params![agent, outcome.to_string()])?;
+            Ok(())
+        })?;
+        assert_eq!(check(&state)?, None);
+        let mut conflicting = state.clone();
+        let binding = conflicting.current_execution_binding.as_mut().unwrap();
+        binding.source_message_id = "other".into();
+        assert_eq!(check(&conflicting)?, blocked);
+        let binding = conflicting.current_execution_binding.as_mut().unwrap();
+        binding.source_message_id = source.id.clone();
+        binding.admission_provenance = Some(ExecutionAdmissionProvenance::Canonical {
+            scenario_class: crate::domain::scheduler::SchedulerScenarioClass::OperatorInterjection,
+            activation_id: "another-attempt".into(),
+        });
+        assert_eq!(check(&conflicting)?, blocked);
+
+        use crate::types::{
+            AgentIdentityRecord, AgentKind, AgentOwnership, AgentProfilePreset,
+            AgentRegistryStatus, AgentVisibility,
+        };
+        let identity = AgentIdentityRecord::new(
+            agent,
+            AgentKind::Named,
+            AgentVisibility::Public,
+            AgentOwnership::SelfOwned,
+            AgentProfilePreset::PublicNamed,
+            None,
+            None,
+        );
+        db.agent_identities().upsert(&identity)?;
+        let store = |state: &AgentState| {
+            db.transaction(|tx| super::super::evidence::upsert_agent_state_tx(tx, state))
+        };
+        let begin = |incarnation| {
+            db.agent_deletions().begin_with_archive_if_incarnation(
+                agent,
+                identity.revision,
+                "synthetic",
+                false,
+                Some(_dir.path()),
+                Some(incarnation),
+            )
+        };
+        store(&conflicting)?;
+        assert!(begin(identity.incarnation).is_err());
+        store(&state)?;
+        assert!(begin(identity.incarnation + 1).is_err());
+        let (retired, job, created) = begin(identity.incarnation)?;
+        assert!(created);
+        assert_eq!(retired.incarnation, identity.incarnation);
+        assert_eq!(retired.status, AgentRegistryStatus::Deleting);
+        assert!(job.archive_path.is_some());
         Ok(())
     }
 

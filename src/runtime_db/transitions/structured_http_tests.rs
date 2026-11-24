@@ -7,6 +7,7 @@ fn issue160_native_brief_settlement_requires_explicit_marker_and_exact_identity(
         for kind in [
             TurnTerminalKind::Completed,
             TurnTerminalKind::ProviderFailedNeedsRecovery,
+            TurnTerminalKind::ProviderFailed,
         ] {
             for variant in [
                 "exact",
@@ -17,7 +18,12 @@ fn issue160_native_brief_settlement_requires_explicit_marker_and_exact_identity(
                 "wrong-attempt",
                 "rollback",
                 "cancelled",
+                "existing-work",
             ] {
+                let caller_owned_failure = kind == TurnTerminalKind::ProviderFailed;
+                if variant == "existing-work" && (work || !caller_owned_failure) {
+                    continue;
+                }
                 let dir = tempfile::tempdir()?;
                 let db = RuntimeDb::open_and_migrate(
                     dir.path().join("runtime.sqlite"),
@@ -54,6 +60,7 @@ fn issue160_native_brief_settlement_requires_explicit_marker_and_exact_identity(
                 original.current_turn_id = Some("turn".into());
                 original.current_run_id = Some("run".into());
                 original.current_turn_work_item_id = message.work_item_id.clone();
+                original.current_work_item_id = (variant == "existing-work").then(|| "work".into());
                 original.current_execution_binding = Some(WorkItemExecutionBinding {
                     turn_id: "turn".into(),
                     source_message_id: message.id.clone(),
@@ -65,6 +72,7 @@ fn issue160_native_brief_settlement_requires_explicit_marker_and_exact_identity(
                 });
                 let mut turn = TurnRecord::new("synthetic", "turn", 3);
                 turn.owner = Some(owner);
+                turn.created_at = now;
                 turn.run_id = Some("run".into());
                 turn.current_work_item_id = message.work_item_id.clone();
                 turn.input_message_ids = vec![message.id.clone()];
@@ -76,7 +84,8 @@ fn issue160_native_brief_settlement_requires_explicit_marker_and_exact_identity(
                         kind
                     },
                     reason: None,
-                    no_brief_reason: None,
+                    no_brief_reason: (caller_owned_failure && variant != "missing")
+                        .then_some(TurnNoBriefReason::StructuredOutputOnly),
                     completed_at: now,
                     duration_ms: 1,
                 });
@@ -104,7 +113,9 @@ fn issue160_native_brief_settlement_requires_explicit_marker_and_exact_identity(
                 } else {
                     message.work_item_id.clone()
                 };
-                turn.produced_brief_ids = vec![brief.id.clone()];
+                if !caller_owned_failure || matches!(variant, "wrong-turn" | "wrong-work") {
+                    turn.produced_brief_ids = vec![brief.id.clone()];
+                }
                 let mut released = original.clone();
                 assert!(
                     crate::runtime::structured_turn_settlement::release_exact_turn(
@@ -152,9 +163,13 @@ fn issue160_native_brief_settlement_requires_explicit_marker_and_exact_identity(
                     fault: None,
                     brief_evidence: vec![],
                 };
-                db.turn_records().upsert(&turn)?;
+                let mut active = turn.clone();
+                active.terminal = None;
+                active.produced_brief_ids.clear();
+                db.turn_records().upsert(&active)?;
                 let result = db.transaction(|tx| {
-                    if variant != "missing" {
+                    upsert_turn_record_tx(tx, &turn)?;
+                    if !turn.produced_brief_ids.is_empty() && variant != "missing" {
                         insert_brief_evidence_tx(tx, &brief)?;
                     }
                     settle_released_http_turn_tx(tx, &command, &turn)?;
@@ -163,15 +178,20 @@ fn issue160_native_brief_settlement_requires_explicit_marker_and_exact_identity(
                     }
                     Ok(())
                 });
+                let valid = if caller_owned_failure {
+                    !work && variant == "exact"
+                } else {
+                    variant == "exact"
+                };
                 assert_eq!(
                     result.is_ok(),
-                    matches!(variant, "exact" | "unmarked"),
+                    valid || variant == "unmarked",
                     "work={work} kind={kind:?} variant={variant}: {result:?}"
                 );
                 let settled: bool = db.connection()?.query_row("SELECT result_settled FROM conversation_turn_revisions WHERE agent_id='synthetic' AND turn_id='turn'", [], |row| row.get(0))?;
                 assert_eq!(
                     settled,
-                    variant == "exact",
+                    valid || (caller_owned_failure && variant == "unmarked"),
                     "work={work} kind={kind:?} variant={variant}"
                 );
             }

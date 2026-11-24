@@ -62,7 +62,8 @@ export type TerminalOutcome =
   | "interrupted"
   | "baseline_over_budget"
   | "deferred_to_fallback"
-  | "provider_failed_needs_recovery";
+  | "provider_failed_needs_recovery"
+  | "provider_failed";
 
 export type ExecutionState =
   | { readonly kind: "active" }

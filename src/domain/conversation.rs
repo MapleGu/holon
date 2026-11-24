@@ -198,6 +198,7 @@ pub enum TerminalOutcome {
     BaselineOverBudget,
     DeferredToFallback,
     ProviderFailedNeedsRecovery,
+    ProviderFailed,
 }
 
 impl From<TurnTerminalKind> for TerminalOutcome {
@@ -209,6 +210,7 @@ impl From<TurnTerminalKind> for TerminalOutcome {
             TurnTerminalKind::BaselineOverBudget => Self::BaselineOverBudget,
             TurnTerminalKind::DeferredToFallback => Self::DeferredToFallback,
             TurnTerminalKind::ProviderFailedNeedsRecovery => Self::ProviderFailedNeedsRecovery,
+            TurnTerminalKind::ProviderFailed => Self::ProviderFailed,
         }
     }
 }
