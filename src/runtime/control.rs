@@ -16,6 +16,58 @@ use crate::{
     },
 };
 
+// The caller retains the native mutation owner until commit_control. The
+// prepared Control's complete snapshot OCC is revalidated by the SQL commit,
+// so a producer changing it after this check causes rejection, never Stop.
+fn ensure_idle_stop_snapshot(snapshot: &ControlSnapshot) -> Result<()> {
+    let state = &snapshot.state;
+    let idle = matches!(
+        state.status,
+        AgentStatus::AwakeIdle | AgentStatus::Asleep | AgentStatus::Stopped
+    ) || (state.status == AgentStatus::AwaitingTask
+        && !snapshot.tasks.is_empty()
+        && snapshot
+            .tasks
+            .iter()
+            .all(|task| task.kind == TaskKind::CommandTask));
+    let idle = idle
+        && state.current_run_id.is_none()
+        && state.current_turn_id.is_none()
+        && state.current_turn_work_item_id.is_none()
+        && state.current_execution_binding.is_none()
+        && state.pending_wake_hint.is_none()
+        && state.sleeping_until.is_none()
+        && state.pending == 0
+        && snapshot.waits.is_empty()
+        && snapshot.queue_entries.is_empty()
+        && snapshot.timers.is_empty()
+        && snapshot.pending_timer_wakes.is_empty()
+        && snapshot.reducer_source_message_id.is_none()
+        && snapshot
+            .attempt_turns
+            .iter()
+            .all(|turn| turn.terminal.is_some())
+        && snapshot.execution_protocol.as_ref().is_none_or(|protocol| {
+            protocol
+                .attempts
+                .values()
+                .all(|attempt| attempt.state != ExecutionAttemptState::Open)
+        })
+        && snapshot
+            .tasks
+            .iter()
+            .all(|task| task.kind == TaskKind::CommandTask);
+    if !idle {
+        return Err(crate::tool::ToolError::new(
+            "agent_stop_requires_idle",
+            "guarded stop refuses active or pending work",
+        )
+        .with_domain(crate::runtime_error::RuntimeErrorDomain::Conflict)
+        .into());
+    }
+    Ok(())
+}
+
 pub(super) struct PreparedRuntimeControl {
     pub(super) command: PreparedControl,
     pub(super) cancellation: Arc<PreparedControlCancellation>,
@@ -157,6 +209,13 @@ impl RuntimeHandle {
                 && &mutation.state == mutation.committed_state(),
             "Control preparation requires the exact published durable baseline"
         );
+        if invocation.source == ControlSource::GuardedStop {
+            anyhow::ensure!(
+                invocation.action == ControlAction::Stop,
+                "idle guard requires Stop"
+            );
+            ensure_idle_stop_snapshot(&snapshot)?;
+        }
         let prepared_at = self.now();
         let protected_control_attempt = protected_control_attempt(&snapshot, &invocation)?;
         let protected_control_run_id = self.protected_control_run_id(
@@ -1040,3 +1099,8 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[cfg(holon_lib_test_shard = "a")]
+#[path = "issue10_guarded_stop_tests.rs"]
+mod issue10_guarded_stop_tests;

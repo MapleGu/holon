@@ -1362,11 +1362,12 @@ pub async fn delete_agent(
     authorize_control(&headers, &state).map_err(authentication_error_response)?;
     let (identity, job, created) = state
         .host
-        .begin_public_agent_deletion_with_archive(
+        .begin_public_agent_deletion_if_incarnation(
             &agent_id,
             request.cascade_private_children,
             "authenticated_operator_control",
             request.archive,
+            request.expected_incarnation,
         )
         .await
         .map_err(agent_access_error)?;
@@ -1379,6 +1380,14 @@ pub async fn delete_agent(
         ),
         job,
     }))
+}
+
+pub async fn agent_deletion_capabilities(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    authorize_control(&headers, &state).map_err(authentication_error_response)?;
+    Ok(Json(json!({ "conditional_idle_delete": true })))
 }
 
 pub async fn agent_deletion_status(
@@ -2846,4 +2855,20 @@ pub async fn control_wake(
         agent_id,
         disposition,
     }))
+}
+
+/// Dedicated route: older daemons cannot silently ignore this guard.
+pub async fn stop_if_incarnation(
+    Path(agent_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ApiJson(request): ApiJson<GuardedStopRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    authorize_control(&headers, &state).map_err(authentication_error_response)?;
+    state
+        .host
+        .stop_public_agent_if_incarnation(&agent_id, request.expected_incarnation.get())
+        .await
+        .map_err(agent_access_error)?;
+    Ok(Json(json!({"ok": true})))
 }

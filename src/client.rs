@@ -840,6 +840,7 @@ impl LocalClient {
         self.delete_control_json(
             &format!("/control/agents/{agent_id}"),
             &DeleteAgentRequest {
+                expected_incarnation: None,
                 cascade_private_children,
                 archive,
             },

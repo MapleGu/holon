@@ -3,8 +3,11 @@
 //! These queries run in the deletion admission transaction. Producers check
 //! the durable fence in the same transaction as their new work/reference.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
+use chrono::Utc;
 use rusqlite::{OptionalExtension, Transaction};
+
+use crate::types::{AgentState, AgentStatus};
 
 /// Existing operator/one-shot deletion retains its cancellation semantics.
 /// Parent cleanup closes new admission without cancelling accepted work.
@@ -60,13 +63,23 @@ const EXECUTION_BLOCKER_CHECKS: &[(&str, &str)] = &[
     ("workspace_occupancy", "SELECT EXISTS(SELECT 1 FROM workspace_occupancies WHERE holder_agent_id = ?1 AND released_at IS NULL)"),
 ];
 
-/// Durable retention state that outlives the current turn. The parent owns the
-/// decision to keep or release it, so it is a diagnostic hint rather than a
-/// blocker for deletion admission or reminder delivery.
+const UNFINISHED_WORK_CHECK: (&str, &str) = (
+    "open_work_item",
+    "SELECT EXISTS(SELECT 1 FROM work_items WHERE agent_id = ?1 AND state != 'completed')",
+);
+
+/// Durable retention state that outlives the current turn. For parent cleanup
+/// and reminder delivery it is a diagnostic hint owned by the parent.
 const RETENTION_BLOCKER_CHECKS: &[(&str, &str)] = &[
-    ("open_work_item", "SELECT EXISTS(SELECT 1 FROM work_items WHERE agent_id = ?1 AND state != 'completed')"),
-    ("timer", "SELECT EXISTS(SELECT 1 FROM timers WHERE agent_id = ?1 AND status = 'active')"),
-    ("timer_wake", "SELECT EXISTS(SELECT 1 FROM timers t JOIN timer_wakes w USING(timer_id) WHERE t.agent_id = ?1 AND w.status = 'pending')"),
+    UNFINISHED_WORK_CHECK,
+    (
+        "timer",
+        "SELECT EXISTS(SELECT 1 FROM timers WHERE agent_id = ?1 AND status = 'active')",
+    ),
+    (
+        "timer_wake",
+        "SELECT EXISTS(SELECT 1 FROM timers t JOIN timer_wakes w USING(timer_id) WHERE t.agent_id = ?1 AND w.status = 'pending')",
+    ),
 ];
 
 /// Fail closed on unknown state. Historical rows alone are not live work.
@@ -84,19 +97,21 @@ fn runtime_state_blocker_tx(tx: &Transaction<'_>, agent_id: &str) -> Result<Opti
     let Some(state) = state else {
         return Ok(Some("unknown_runtime_state".into()));
     };
-    let state: crate::types::AgentState = serde_json::from_str(&state)?;
-    if !matches!(
+    let state: AgentState = serde_json::from_str(&state)?;
+    Ok(runtime_state_blocker(
+        &state,
+        state.sleeping_until.is_some(),
+    ))
+}
+
+fn runtime_state_blocker(state: &AgentState, has_scheduled_sleep: bool) -> Option<String> {
+    (!matches!(
         state.status,
-        crate::types::AgentStatus::AwakeIdle
-            | crate::types::AgentStatus::Asleep
-            | crate::types::AgentStatus::Stopped
+        AgentStatus::AwakeIdle | AgentStatus::Asleep | AgentStatus::Stopped
     ) || state.current_run_id.is_some()
-        || state.sleeping_until.is_some()
-        || state.pending_wake_hint.is_some()
-    {
-        return Ok(Some("runtime_execution_or_wake".into()));
-    }
-    Ok(None)
+        || has_scheduled_sleep
+        || state.pending_wake_hint.is_some())
+    .then(|| "runtime_execution_or_wake".into())
 }
 
 // Each query uses an owner/target index. Keep these predicates aligned with
@@ -134,6 +149,44 @@ pub(crate) fn execution_blocker_tx(tx: &Transaction<'_>, agent_id: &str) -> Resu
         return Ok(Some(blocker));
     }
     first_blocker_tx(tx, agent_id, EXECUTION_BLOCKER_CHECKS)
+}
+
+/// Check live work before fencing the operator's conditional delete. An elapsed
+/// sleep deadline can remain in the projection after its Work and timers settle.
+pub(crate) fn conditional_delete_blocker_tx(
+    tx: &Transaction<'_>,
+    state: &AgentState,
+) -> Result<Option<String>> {
+    let now = Utc::now();
+    let has_scheduled_sleep = state.sleeping_until.is_some_and(|deadline| deadline > now);
+    if let Some(blocker) = runtime_state_blocker(state, has_scheduled_sleep) {
+        return Ok(Some(blocker));
+    }
+    if let Some(blocker) = first_blocker_tx(tx, &state.id, EXECUTION_BLOCKER_CHECKS)? {
+        return Ok(Some(blocker));
+    }
+    if let Some(blocker) = first_blocker_tx(tx, &state.id, &[UNFINISHED_WORK_CHECK])? {
+        return Ok(Some(blocker));
+    }
+    reclamation_timer_blocker_tx(tx, &state.id)
+}
+
+/// Operator reclamation must preserve scheduled work and deliveries,
+/// even after a one-shot timer is completed. Run inside the writer's transaction.
+pub(crate) fn reclamation_timer_blocker_tx(
+    tx: &Transaction<'_>,
+    agent_id: &str,
+) -> Result<Option<String>> {
+    first_blocker_tx(
+        tx,
+        agent_id,
+        &[
+            ("timer", "SELECT EXISTS(SELECT 1 FROM timers WHERE agent_id = ?1 AND status NOT IN ('completed','cancelled'))"),
+            ("timer_wake", "SELECT EXISTS(SELECT 1 FROM timers t JOIN timer_wakes w USING(timer_id) WHERE t.agent_id = ?1 AND w.status NOT IN ('incorporated','cancelled'))"),
+            ("managed_timer_delivery", "SELECT EXISTS(SELECT 1 FROM managed_timers m JOIN managed_timer_deliveries d USING(timer_id) WHERE m.agent_id = ?1 AND d.status NOT IN ('acknowledged','cancelled'))"),
+            ("managed_timer_missing", "SELECT EXISTS(SELECT 1 FROM managed_timers m LEFT JOIN timers t USING(timer_id) WHERE m.agent_id = ?1 AND (t.timer_id IS NULL OR t.agent_id != m.agent_id))"),
+        ],
+    )
 }
 
 /// Deletion admission for a supervised child. Execution blockers, descendant

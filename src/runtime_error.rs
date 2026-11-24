@@ -1359,3 +1359,25 @@ mod tests {
         );
     }
 }
+
+/// Shared native precondition; callers retain the mutation fence through commit.
+pub(crate) fn check_expected_incarnation(
+    agent_id: &str,
+    expected: u64,
+    actual: Option<u64>,
+) -> anyhow::Result<()> {
+    if expected == 0 {
+        return Err(ToolError::new(
+            "invalid_expected_incarnation",
+            "expected_incarnation must be positive",
+        )
+        .with_domain(RuntimeErrorDomain::Validation)
+        .into());
+    }
+    if actual != Some(expected) {
+        return Err(ToolError::new("agent_incarnation_mismatch", "target incarnation changed")
+            .with_domain(RuntimeErrorDomain::Conflict)
+            .with_details(serde_json::json!({"agent_id": agent_id, "expected_incarnation": expected, "actual_incarnation": actual})).into());
+    }
+    Ok(())
+}

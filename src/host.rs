@@ -4970,6 +4970,24 @@ impl RuntimeHost {
         requested_by: &str,
         archive: bool,
     ) -> std::result::Result<(AgentIdentityRecord, AgentDeletionJob, bool), PublicAgentError> {
+        self.begin_public_agent_deletion_if_incarnation(
+            agent_id,
+            cascade_private_children,
+            requested_by,
+            archive,
+            None,
+        )
+        .await
+    }
+
+    pub async fn begin_public_agent_deletion_if_incarnation(
+        &self,
+        agent_id: &str,
+        cascade_private_children: bool,
+        requested_by: &str,
+        archive: bool,
+        expected_incarnation: Option<u64>,
+    ) -> std::result::Result<(AgentIdentityRecord, AgentDeletionJob, bool), PublicAgentError> {
         let host = self.clone();
         let agent_id = agent_id.to_string();
         let requested_by = requested_by.to_string();
@@ -4980,6 +4998,7 @@ impl RuntimeHost {
                     cascade_private_children,
                     &requested_by,
                     archive,
+                    expected_incarnation,
                 )
                 .await)
         })
@@ -4993,11 +5012,25 @@ impl RuntimeHost {
         cascade_private_children: bool,
         requested_by: &str,
         archive: bool,
+        expected_incarnation: Option<u64>,
     ) -> std::result::Result<(AgentIdentityRecord, AgentDeletionJob, bool), PublicAgentError> {
         self.validate_agent_id(agent_id)
             .map_err(PublicAgentError::Runtime)?;
         let bootstrap_lock = self.agent_bootstrap_lock(agent_id);
         let _bootstrap_guard = bootstrap_lock.lock().await;
+        // Reject a wrong guard before owner reconciliation can publish metadata.
+        // The transaction below is the authoritative recheck at admission.
+        if let Some(expected) = expected_incarnation {
+            let current = self
+                .agent_identity_record(agent_id)
+                .map_err(PublicAgentError::Runtime)?;
+            crate::runtime_error::check_expected_incarnation(
+                agent_id,
+                expected,
+                current.as_ref().map(|i| i.incarnation),
+            )
+            .map_err(PublicAgentError::Runtime)?;
+        }
         let mut reservations = self
             .reserve_agent_mutations(&[agent_id.to_string()])
             .await
@@ -5008,6 +5041,14 @@ impl RuntimeHost {
             .ok_or_else(|| PublicAgentError::NotFound {
                 agent_id: agent_id.to_string(),
             })?;
+        if let Some(expected) = expected_incarnation {
+            crate::runtime_error::check_expected_incarnation(
+                agent_id,
+                expected,
+                Some(identity.incarnation),
+            )
+            .map_err(PublicAgentError::Runtime)?;
+        }
         if agent_id == self.config().default_agent_id {
             return Err(PublicAgentError::DeleteForbidden {
                 agent_id: agent_id.to_string(),
@@ -5030,23 +5071,60 @@ impl RuntimeHost {
         let mut facts = self
             .external_identity_facts(&reservations)
             .map_err(PublicAgentError::Runtime)?;
+        let loaded = if expected_incarnation.is_some()
+            && identity.status == AgentRegistryStatus::Active
+        {
+            self.bridge()
+                .runtime_for_mutation(&reservations[0])
+                .await
+                .map_err(PublicAgentError::Runtime)?
+        } else {
+            None
+        };
         let mut acknowledged = None;
-        let committed = self
-            .commit_external_metadata(&mut reservations, ids::audit_event_id(), || {
-                let admitted = self.runtime_db().agent_deletions().begin_with_archive(
-                    agent_id,
-                    identity.revision,
-                    requested_by,
-                    cascade_private_children,
-                    archive.then_some(archive_root.as_path()),
-                )?;
+        let mut admission_started = false;
+        let admit = || {
+            admission_started = true;
+            self.acknowledge_external_metadata(&mut reservations, ids::audit_event_id(), || {
+                let admitted = self
+                    .runtime_db()
+                    .agent_deletions()
+                    .begin_with_archive_if_incarnation(
+                        agent_id,
+                        identity.revision,
+                        requested_by,
+                        cascade_private_children,
+                        archive.then_some(archive_root.as_path()),
+                        expected_incarnation,
+                    )?;
                 for fact in &mut facts {
                     fact.identity = Some(Arc::new(admitted.0.clone()));
                 }
                 acknowledged = Some(admitted.clone());
                 Ok((admitted, facts))
             })
-            .await;
+        };
+        // Match idle retirement's gate: an already leased operation may have
+        // no durable execution evidence yet. The gate reopens if admission fails.
+        let admitted = if let Some(runtime) = loaded {
+            runtime.admit_idle_cleanup_reserved(admit).await
+        } else {
+            admit()
+        };
+        let committed = match admitted {
+            Ok(admitted) => self
+                .publish_external_metadata(&mut reservations)
+                .await
+                .map(|()| admitted),
+            Err(error) if !admission_started => Err(crate::tool::ToolError::new(
+                "agent_delete_blocked",
+                "conditional deletion has live runtime obligations",
+            )
+            .with_domain(crate::runtime_error::RuntimeErrorDomain::Conflict)
+            .with_details(serde_json::json!({"blocker": error.to_string()}))
+            .into()),
+            Err(error) => Err(error),
+        };
         let (updated_identity, job, created) = match committed {
             Ok(admitted) => admitted,
             Err(error) => {
@@ -5471,6 +5549,53 @@ impl RuntimeHost {
             .await
             .map_err(PublicAgentError::Runtime)?;
         Ok(runtime)
+    }
+
+    /// The same lifecycle lock excludes create/delete/reincarnation until Stop
+    /// has committed. Control itself remains fenced by its native incarnation
+    /// ControlKey and mutation-owner reservation (including concurrent Start).
+    pub async fn stop_public_agent_if_incarnation(
+        &self,
+        agent_id: &str,
+        expected_incarnation: u64,
+    ) -> std::result::Result<(), PublicAgentError> {
+        let lock = self.agent_bootstrap_lock(agent_id);
+        let _guard = lock.lock().await;
+        let identity = self
+            .agent_identity_record(agent_id)
+            .map_err(PublicAgentError::Runtime)?;
+        crate::runtime_error::check_expected_incarnation(
+            agent_id,
+            expected_incarnation,
+            identity.as_ref().map(|i| i.incarnation),
+        )
+        .map_err(PublicAgentError::Runtime)?;
+        self.public_agent_identity(agent_id)?;
+        let runtime = self
+            .activate_agent_observed_for_incarnation(
+                agent_id,
+                RuntimeActivationReason::OperatorControl,
+                None,
+                Some(expected_incarnation),
+            )
+            .await
+            .map_err(Self::public_activation_error)?;
+        runtime
+            .wait_for_bootstrap()
+            .await
+            .map_err(PublicAgentError::Runtime)?;
+        crate::runtime_error::check_expected_incarnation(
+            agent_id,
+            expected_incarnation,
+            Some(runtime.instance_incarnation()),
+        )
+        .map_err(PublicAgentError::Runtime)?;
+        runtime
+            .stop_if_idle_for_incarnation(expected_incarnation)
+            .await
+            .map_err(PublicAgentError::Runtime)?;
+        self.notify_runtime_recovery(agent_id).await;
+        Ok(())
     }
 
     pub async fn control_public_agent(
@@ -12149,6 +12274,9 @@ mod tests {
     #[cfg(holon_lib_test_shard = "d")]
     #[path = "cold_work_queue_phase_tests.rs"]
     mod cold_work_queue_phase_tests;
+    #[cfg(holon_lib_test_shard = "d")]
+    #[path = "issue10_tests.rs"]
+    mod issue10_tests;
     #[cfg(holon_lib_test_shard = "d")]
     #[path = "projection_brief_preview_tests.rs"]
     mod projection_brief_preview_tests;

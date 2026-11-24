@@ -4,6 +4,40 @@ use super::*;
 use crate::runtime_db::control_transition::{ControlInvocation, ControlKey, ControlSource};
 
 impl RuntimeHandle {
+    /// Guard and Stop share one native mutation owner. Unlike ordinary Stop,
+    /// this entry may clean up residual command tasks but never cancel a Turn.
+    pub(crate) async fn stop_if_idle_for_incarnation(&self, expected: u64) -> Result<()> {
+        crate::runtime_error::check_expected_incarnation(
+            self.inner.mutation_owner.agent_id(),
+            expected,
+            Some(self.instance_incarnation()),
+        )?;
+        let admission = self.execution_admission_lease()?;
+        let (key, mut invocation) =
+            self.freeze_direct_control(ControlAction::Stop, AuthorityClass::OperatorInstruction);
+        invocation.source = ControlSource::GuardedStop;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let runtime = self.clone();
+        self.spawn_owned_mutation(async move {
+            let _admission = admission;
+            let result = async {
+                let mut mutation = runtime.begin_mutation().await?;
+                let prepared = runtime
+                    .prepare_runtime_control(&mutation, key, invocation)
+                    .await?;
+                mutation.commit_control(&prepared).await?;
+                drop(mutation);
+                runtime.inner.notify.notify_one();
+                Ok(())
+            }
+            .await;
+            let _ = send.send(result);
+        })?;
+        receive
+            .await
+            .map_err(|_| anyhow!("owned guarded Stop worker ended without outcome"))?
+    }
+
     /// Only a Host-owned, already-admitted retirement handoff calls this path.
     pub(crate) async fn apply_host_admitted_control(
         &self,

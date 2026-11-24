@@ -697,6 +697,14 @@ pub fn router(state: AppState) -> Router {
             "/control/agents/{agent_id}/name",
             patch(control::rename_agent),
         )
+        .route(
+            "/control/agents/{agent_id}/stop-if-incarnation",
+            post(control::stop_if_incarnation),
+        )
+        .route(
+            "/control/agent-deletion-capabilities",
+            get(control::agent_deletion_capabilities),
+        )
         .route("/control/agents/{agent_id}", delete(control::delete_agent))
         .route(
             "/control/agents/{agent_id}/delete-status",
@@ -4274,3 +4282,8 @@ mod tests {
         assert!(!if_none_match_satisfied(&HeaderMap::new(), "\"abc\""));
     }
 }
+
+#[cfg(test)]
+#[cfg(holon_lib_test_shard = "c")]
+#[path = "issue10_tests.rs"]
+mod issue10_tests;

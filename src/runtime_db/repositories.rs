@@ -2008,7 +2008,127 @@ impl AgentDeletionRepository<'_> {
         cascade_private_children: bool,
         archive_root: Option<&std::path::Path>,
     ) -> Result<(AgentIdentityRecord, AgentDeletionJob, bool)> {
+        self.begin_with_archive_if_incarnation(
+            agent_id,
+            expected_identity_revision,
+            requested_by,
+            cascade_private_children,
+            archive_root,
+            None,
+        )
+    }
+
+    pub(crate) fn begin_with_archive_if_incarnation(
+        &self,
+        agent_id: &str,
+        expected_identity_revision: u64,
+        requested_by: &str,
+        cascade_private_children: bool,
+        archive_root: Option<&std::path::Path>,
+        expected_incarnation: Option<u64>,
+    ) -> Result<(AgentIdentityRecord, AgentDeletionJob, bool)> {
         self.db.transaction(|tx| {
+            if let Some(expected) = expected_incarnation {
+                // Read through this transaction, never through a separate reader.
+                let current = AgentIdentityRepository::latest_on(tx, agent_id)?;
+                crate::runtime_error::check_expected_incarnation(
+                    agent_id,
+                    expected,
+                    current.as_ref().map(|i| i.incarnation),
+                )?;
+                // Repeated admission for this exact retired identity is idempotent,
+                // even after finalization removed its runtime state.
+                if let Some(identity) = current
+                    .as_ref()
+                    .filter(|i| i.status != AgentRegistryStatus::Active)
+                {
+                    let payload: Option<String> = tx
+                        .query_row(
+                            "SELECT payload_json FROM agent_deletion_jobs WHERE agent_id=?1",
+                            [agent_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let job: AgentDeletionJob = payload
+                        .map(|payload| serde_json::from_str(&payload))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            crate::tool::ToolError::new(
+                                "agent_delete_job_missing",
+                                "retired identity has no deletion job",
+                            )
+                            .with_domain(crate::runtime_error::RuntimeErrorDomain::Conflict)
+                        })?;
+                    // Native jobs are current-per-agent, not independently named
+                    // historical jobs. Reincarnation is Active and must go through
+                    // new admission, which replaces the previous incarnation's job.
+                    anyhow::ensure!(
+                        job.agent_id == identity.agent_id
+                            && job.expected_identity_revision <= identity.revision
+                            && job.created_at >= identity.created_at,
+                        "conditional deletion job does not match the retired identity"
+                    );
+                    if archive_root.is_some() && job.archive_path.is_none() {
+                        return Err(crate::tool::ToolError::new(
+                            "agent_archive_not_requested",
+                            "cannot enable archival after deletion started",
+                        )
+                        .with_domain(crate::runtime_error::RuntimeErrorDomain::Conflict)
+                        .into());
+                    }
+                    // Do not call generic ensure_agent_deletion_tx here: its
+                    // Deleted/Completed branch intentionally starts CleanupRepair.
+                    return Ok((identity.clone(), job, false));
+                }
+                if current
+                    .as_ref()
+                    .is_some_and(|i| i.status == AgentRegistryStatus::Active)
+                {
+                    let state: Option<String> = tx
+                        .query_row(
+                            "SELECT payload_json FROM agent_states WHERE agent_id=?1",
+                            [agent_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let state = state
+                        .map(|s| serde_json::from_str::<AgentState>(&s))
+                        .transpose()?;
+                    let Some(state) = state.filter(|s| {
+                        s.id == agent_id
+                            && matches!(
+                                s.status,
+                                AgentStatus::Stopped | AgentStatus::Asleep | AgentStatus::AwakeIdle
+                            )
+                    }) else {
+                        return Err(crate::tool::ToolError::new(
+                            "agent_delete_requires_idle",
+                            "conditional deletion requires an idle or stopped state",
+                        )
+                        .with_domain(crate::runtime_error::RuntimeErrorDomain::Conflict)
+                        .into());
+                    };
+                    if super::current_query::pending_queue_count(tx, agent_id)? != 0 {
+                        return Err(crate::tool::ToolError::new(
+                            "agent_delete_blocked",
+                            "conditional deletion has pending inputs",
+                        )
+                        .with_domain(crate::runtime_error::RuntimeErrorDomain::Conflict)
+                        .into());
+                    }
+                    if let Some(blocker) =
+                        super::reclamation::conditional_delete_blocker_tx(tx, &state)?
+                    {
+                        return Err(crate::tool::ToolError::new(
+                            "agent_delete_blocked",
+                            "conditional deletion has live obligations",
+                        )
+                        .with_domain(crate::runtime_error::RuntimeErrorDomain::Conflict)
+                        .with_details(serde_json::json!({"blocker": blocker}))
+                        .into());
+                    }
+                }
+            }
             let (identity, mut job, created) = ensure_agent_deletion_tx(
                 tx,
                 &AgentDeletionRequest {

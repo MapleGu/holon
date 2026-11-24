@@ -24,6 +24,12 @@ pub struct RenameAgentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteAgentRequest {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expected_incarnation"
+    )]
+    pub expected_incarnation: Option<u64>,
     #[serde(default)]
     pub cascade_private_children: bool,
     #[serde(default)]
@@ -579,4 +585,64 @@ pub struct CreateAgentRequest {
     pub default_initial_message: Option<bool>,
     #[serde(default)]
     pub name: Option<String>,
+}
+
+// Omission is unconditional; explicit null/zero/malformed values never are.
+fn deserialize_expected_incarnation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "expected_incarnation must be positive",
+        ));
+    }
+    Ok(Some(value))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedStopRequest {
+    pub expected_incarnation: std::num::NonZeroU64,
+}
+
+#[cfg(test)]
+mod issue10_wire_tests {
+    use super::*;
+    #[test]
+    fn issue10_guarded_wire_is_strict() {
+        for body in [
+            r#"{}"#,
+            r#"{"expected_incarnation":null}"#,
+            r#"{"expected_incarnation":0}"#,
+            r#"{"expected_incarnation":-1}"#,
+            r#"{"expected_incarnation":"1"}"#,
+            r#"{"expected_incarnation":1,"action":"start"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<GuardedStopRequest>(body).is_err(),
+                "{body}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<GuardedStopRequest>(r#"{"expected_incarnation":1}"#).is_ok()
+        );
+        assert!(
+            serde_json::from_str::<DeleteAgentRequest>(r#"{"archive":true}"#)
+                .unwrap()
+                .archive
+        );
+        for body in [
+            r#"{"expected_incarnation":null}"#,
+            r#"{"expected_incarnation":0}"#,
+            r#"{"expected_incarnation":-1}"#,
+            r#"{"expected_incarnation":"1"}"#,
+            r#"{"expected_incarnation":1,"unexpected":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DeleteAgentRequest>(body).is_err(),
+                "{body}"
+            );
+        }
+    }
 }

@@ -62,6 +62,7 @@ pub(crate) struct ControlKey {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ControlSource {
     DirectApi,
+    GuardedStop,
     ControlMessage { message_id: String },
 }
 
@@ -1319,6 +1320,17 @@ impl RuntimeDb {
             if actual != *command.expected {
                 return Err(RuntimeStateTransitionConflict::concurrent_mutation("control_targets", &command.key.agent_id).into());
             }
+            if command.invocation.source == ControlSource::GuardedStop {
+                if let Some(blocker) = super::reclamation::reclamation_timer_blocker_tx(tx, &command.key.agent_id)? {
+                    return Err(crate::tool::ToolError::new(
+                        "agent_stop_requires_idle",
+                        "guarded stop refuses pending timers or deliveries",
+                    )
+                    .with_domain(crate::runtime_error::RuntimeErrorDomain::Conflict)
+                    .with_details(serde_json::json!({"blocker": blocker}))
+                    .into());
+                }
+            }
             validate_source_tx(tx, command)?;
             for turn in &command.interrupted_turns {
                     super::input_evidence_snapshot::validate_existing_input_evidence_tx(tx,&crate::runtime::resident_input_evidence::InputEvidenceScope { agent_id: command.key.agent_id.clone(), identity_incarnation: command.key.identity_incarnation },
@@ -2242,7 +2254,7 @@ fn validate_key(key: &ControlKey) -> Result<()> {
 
 fn protected_message(invocation: &ControlInvocation) -> Option<&str> {
     match &invocation.source {
-        ControlSource::DirectApi => None,
+        ControlSource::DirectApi | ControlSource::GuardedStop => None,
         ControlSource::ControlMessage { message_id } => Some(message_id),
     }
 }
