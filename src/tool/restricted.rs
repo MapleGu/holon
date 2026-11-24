@@ -6,6 +6,10 @@ use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 const MAX_IO: usize = 64 * 1024;
 #[derive(Clone, Serialize, PartialEq)]
 pub struct ToolAllowlist {
@@ -13,6 +17,8 @@ pub struct ToolAllowlist {
     tools: Vec<RegisteredTool>,
     bridge: Bridge,
     structured_output_only: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    compact_system_prompt: bool,
 }
 impl std::fmt::Debug for ToolAllowlist {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -43,6 +49,8 @@ impl<'de> Deserialize<'de> for ToolAllowlist {
             bridge: Bridge,
             #[serde(default)]
             structured_output_only: bool,
+            #[serde(default)]
+            compact_system_prompt: bool,
         }
         let wire =
             Wire::deserialize(d).map_err(|_| serde::de::Error::custom("invalid tool_allowlist"))?;
@@ -52,6 +60,7 @@ impl<'de> Deserialize<'de> for ToolAllowlist {
                 tools: wire.tools,
                 bridge: wire.bridge,
                 structured_output_only: wire.structured_output_only,
+                compact_system_prompt: wire.compact_system_prompt,
             };
             policy.validate()?;
             Ok(policy)
@@ -60,6 +69,10 @@ impl<'de> Deserialize<'de> for ToolAllowlist {
     }
 }
 impl ToolAllowlist {
+    pub(crate) fn compact_system_prompt(&self) -> bool {
+        self.compact_system_prompt
+    }
+
     pub(crate) fn structured_output_only(&self) -> bool {
         self.structured_output_only
     }
@@ -68,6 +81,11 @@ impl ToolAllowlist {
         let valid = || -> Result<()> {
             ensure!(serde_json::to_vec(self)?.len() <= MAX_IO, "size");
             ensure!(self.tools.len() <= 16, "tools");
+            ensure!(
+                !self.compact_system_prompt
+                    || (self.structured_output_only && self.tools.len() == 1),
+                "compact requires structured output and one tool"
+            );
             let prefix = self.tool_name_prefix.as_bytes();
             ensure!(
                 (2..=63).contains(&prefix.len())
@@ -113,10 +131,7 @@ impl ToolAllowlist {
                         .strip_prefix(&self.tool_name_prefix)
                         .is_some_and(|suffix| !suffix.is_empty())
                         && (8..=64).contains(&tool.name.len())
-                        && tool
-                            .name
-                            .bytes()
-                            .all(is_tool_name_byte)
+                        && tool.name.bytes().all(is_tool_name_byte)
                         && names.insert(&tool.name),
                     "name"
                 );
@@ -452,6 +467,38 @@ mod tests {
         assert_eq!(serde_json::to_value(opted_in).unwrap(), value);
         value["structured_output_only"] = json!("true");
         assert!(serde_json::from_value::<ToolAllowlist>(value).is_err());
+    }
+
+    #[test]
+    fn compact_prompt_requires_structured_single_tool_policy() {
+        let mut value = json!({"tool_name_prefix":"fixture_","tools":[{"name":"fixture_submit","description":"Synthetic result","parameters":{"type":"object"}}],"bridge":{"url":"http://127.0.0.1:34567/call","bearer":"synthetic-compact-policy"}});
+        assert!(!serde_json::from_value::<ToolAllowlist>(value.clone())
+            .unwrap()
+            .compact_system_prompt());
+        value["compact_system_prompt"] = json!(true);
+        assert!(serde_json::from_value::<ToolAllowlist>(value.clone()).is_err());
+        value["structured_output_only"] = json!(true);
+        let policy: ToolAllowlist = serde_json::from_value(value.clone()).unwrap();
+        assert!(policy.compact_system_prompt());
+        assert!(
+            serde_json::from_value::<ToolAllowlist>(serde_json::to_value(&policy).unwrap())
+                .unwrap()
+                .compact_system_prompt()
+        );
+        assert!(policy.check("ExecCommand").is_err());
+        for invalid in [json!(null), json!("true"), json!(1)] {
+            let mut bad = value.clone();
+            bad["compact_system_prompt"] = invalid;
+            assert!(serde_json::from_value::<ToolAllowlist>(bad).is_err());
+        }
+        for tools in [
+            json!([]),
+            json!([value["tools"][0].clone(), {"name":"fixture_second","description":"second","parameters":{"type":"object"}}]),
+        ] {
+            let mut bad = value.clone();
+            bad["tools"] = tools;
+            assert!(serde_json::from_value::<ToolAllowlist>(bad).is_err());
+        }
     }
 
     #[test]

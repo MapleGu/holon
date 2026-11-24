@@ -924,6 +924,7 @@ impl RuntimeHandle {
             &prompt_tools,
             ToolPromptContext {
                 apply_patch_surface: Some(apply_patch_surface),
+                compact_system_prompt: self.bounded_compact_turn(snapshot.agent())?,
             },
         )?
         .with_media_tool_defaults(&media_defaults, &prompt_tools);

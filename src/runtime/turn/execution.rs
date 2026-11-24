@@ -1595,6 +1595,11 @@ impl RuntimeHandle {
     ) -> Result<OperatorInterjectionPlan> {
         use crate::types::ExecutionAdmissionProvenance;
 
+        // Bounded structured turns keep other sources queued for their own claim.
+        if self.bounded_compact_turn(expected_state)? {
+            return Ok(OperatorInterjectionPlan::RetainSource);
+        }
+
         if self
             .inner
             .runtime_db
@@ -4816,6 +4821,17 @@ impl<'a> TurnExecution<'a> {
             persist_terminal,
             trace_context,
         } = self;
+        // Freeze the mode actually selected for this turn, including full fallback.
+        {
+            let guard = runtime.inner.agent.lock().await;
+            if let Some(turn_id) = guard.state.current_turn_id.as_ref() {
+                *runtime.inner.bounded_prompt_selection.lock()
+                    .map_err(|_| anyhow::anyhow!("bounded prompt selection lock poisoned"))? = Some((
+                    turn_id.clone(), effective_prompt.system_sections.iter()
+                        .any(|section| section.name == "bounded_structured_contract"),
+                ));
+            }
+        }
         let mut completed_rounds = Vec::<TurnRoundRecord>::new();
         let turn_started_at = Instant::now();
         let mut sleep_duration_ms = None;

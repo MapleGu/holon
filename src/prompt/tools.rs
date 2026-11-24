@@ -10,6 +10,8 @@ use crate::tool::{ApplyPatchSurface, ToolSpec};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ToolPromptContext {
     pub apply_patch_surface: Option<ApplyPatchSurface>,
+    /// Selected only from the authenticated per-incarnation restricted policy.
+    pub compact_system_prompt: bool,
 }
 
 fn guidance(content: &'static str) -> String {

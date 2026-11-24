@@ -4,6 +4,7 @@
 //! - `tools`: Tool-specific prompt guidance (registry-style)
 //! - Top-level: execution-oriented sections and overall assembly
 
+pub(crate) mod compact;
 mod fingerprint;
 mod resources;
 pub mod time;
@@ -778,6 +779,7 @@ pub fn build_effective_prompt_with_apply_patch_surface_and_default_external_ingr
         available_tools,
         ToolPromptContext {
             apply_patch_surface: Some(apply_patch_surface),
+            ..ToolPromptContext::default()
         },
         continuation,
         default_external_ingress,
@@ -913,6 +915,11 @@ fn assemble_effective_prompt(
 ) -> Result<EffectivePrompt> {
     let loaded_agents_md = loaded_agents_md.into();
     let loaded_agent_memory = loaded_agent_memory.into();
+    let tool_prompt_context = ToolPromptContext {
+        compact_system_prompt: tool_prompt_context.compact_system_prompt
+            && available_tools.len() == 1 && compact::eligible(session, current_message, identity),
+        ..tool_prompt_context
+    };
     let system_sections = build_system_sections(
         identity,
         current_message,
@@ -1242,8 +1249,11 @@ fn build_system_sections(
     if let Some(section) = event_turn_section(current_message) {
         sections.push(section);
     }
-    if let Some(section) = constrained_repair_section(current_message) {
-        sections.push(section);
+    // A bounded caller prompt may contain untrusted source text, not an edit request.
+    if !tool_prompt_context.compact_system_prompt {
+        if let Some(section) = constrained_repair_section(current_message) {
+            sections.push(section);
+        }
     }
     if let Some(section) =
         user_global_agents_md_section(loaded_agents_md.user_global_source.as_ref())
@@ -1274,6 +1284,9 @@ fn build_system_sections(
         tool_prompt_context,
     ));
     sections.push(response_language_section());
+    if tool_prompt_context.compact_system_prompt {
+        compact::compact_sections(&mut sections);
+    }
     sections
 }
 
@@ -1548,6 +1561,10 @@ mod tests {
     };
 
     use super::*;
+
+    mod compact_tests {
+        include!("compact_tests.rs");
+    }
 
     fn sample_message() -> MessageEnvelope {
         MessageEnvelope::new(

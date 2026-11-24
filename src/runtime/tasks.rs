@@ -3807,6 +3807,10 @@ impl RuntimeHandle {
             .prepare_work_command_read(&record, WorkCommandReadMode::Focus { clear_blocker })
             .await?;
         let state = read.state.as_ref().clone();
+        if self.bounded_compact_turn(&state)? {
+            return Err(RuntimeError::validation("bounded_turn_work_pick_forbidden",
+                "cannot change Work focus during a bounded structured turn").into());
+        }
         let current_id = state.current_work_item_id.clone();
         let previous = current_id
             .as_deref()

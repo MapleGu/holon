@@ -911,6 +911,7 @@ impl RuntimeHandle {
 
         let runtime = Self {
             inner: Arc::new(RuntimeInner {
+                bounded_prompt_selection: StdMutex::new(None),
                 identity_incarnation,
                 scheduler_audit_frontier,
                 context_tool_policy: ArcSwapOption::empty(),

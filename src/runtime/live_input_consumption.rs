@@ -23,6 +23,9 @@ impl RuntimeHandle {
             &mutation.input_evidence_scope(),
         )?;
         let (expected_state, snapshot, cancelled) = mutation.idle_selection_snapshot(&material)?;
+        if self.bounded_compact_turn(&expected_state)? {
+            return Ok(Vec::new());
+        }
         if mutation
             .queue
             .peek_next_matching(scheduler::is_operator_interjection_message)

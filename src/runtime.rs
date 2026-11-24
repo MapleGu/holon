@@ -1,6 +1,7 @@
 mod agent_message_delivery;
 mod agent_services;
 mod bootstrap;
+mod bounded_compact;
 mod callback;
 #[path = "runtime/child_task_producer_actor.rs"]
 mod child_task_producer_actor;
@@ -795,6 +796,7 @@ pub struct RuntimeHandle {
 
 struct RuntimeInner {
     identity_incarnation: u64,
+    bounded_prompt_selection: StdMutex<Option<(String, bool)>>,
     mutation_owner: mutation_owner::MutationOwner,
     input_evidence_budget: input_evidence_budget::InputEvidenceBudgetLedger,
     standalone_related_mutation_owners: mutation_owner::MutationOwnerRegistry,
