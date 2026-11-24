@@ -85,6 +85,7 @@ pub(crate) struct AwaitWaitReportDirective {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ToolLoopDirective {
+    CompleteStructuredOutput,
     AwaitCompletionReport(AwaitCompletionReportDirective),
     AwaitWaitReport(AwaitWaitReportDirective),
 }

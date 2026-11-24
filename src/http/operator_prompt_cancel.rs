@@ -4,6 +4,8 @@ use super::*;
 #[serde(deny_unknown_fields)]
 pub struct CancelRequest {
     client_request_id: String,
+    #[serde(default)]
+    complete_structured_output: bool,
 }
 pub async fn cancel(
     Path(agent): Path<String>,
@@ -28,10 +30,16 @@ pub async fn cancel(
         .get_operator_agent(&agent)
         .await
         .map_err(agent_access_error)?;
-    let outcome = runtime
-        .cancel_operator_prompt(incarnation, principal, input.client_request_id.clone())
-        .await
-        .map_err(conversation::conversation_error)?;
+    let outcome = if input.complete_structured_output {
+        runtime
+            .complete_claimed_structured_prompt(incarnation, principal, &input.client_request_id)
+            .await
+    } else {
+        runtime
+            .cancel_operator_prompt(incarnation, principal, input.client_request_id.clone())
+            .await
+    }
+    .map_err(conversation::conversation_error)?;
     Ok(Json(CancelResponse {
         agent_id: agent,
         incarnation,

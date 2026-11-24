@@ -23,7 +23,9 @@ impl RuntimeHandle {
             &mutation.input_evidence_scope(),
         )?;
         let (expected_state, snapshot, cancelled) = mutation.idle_selection_snapshot(&material)?;
-        if self.bounded_compact_turn(&expected_state)? {
+        if self.bounded_compact_turn(&expected_state)?
+            || self.structured_completion_isolates_input(&expected_state)?
+        {
             return Ok(Vec::new());
         }
         if mutation

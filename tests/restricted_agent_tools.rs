@@ -109,7 +109,7 @@ async fn restricted_agent_wire_auth_validation_and_atomic_failure() -> Result<()
         .await?;
     assert_eq!(
         caps,
-        json!({"toolAllowlist":true,"promptCancellation":true,"structuredOutputOnly":true,"compactSystemPrompt":true})
+        json!({"toolAllowlist":true,"promptCancellation":true,"structuredOutputOnly":true,"compactSystemPrompt":true,"structuredToolCompletion":true})
     );
     let create = format!("{base}/api/control/agents/custom-prefix/restricted/create");
     let mut custom = policy(34567);
@@ -170,6 +170,12 @@ async fn restricted_agent_wire_auth_validation_and_atomic_failure() -> Result<()
     for path in ["extra", "bearer"] {
         let mut p = policy(34567);
         p[path] = json!(TOKEN);
+        invalid.push(p);
+    }
+    for (structured, tool) in [(false, "fixture_record_lookup"), (true, "fixture_other")] {
+        let mut p = policy(34567);
+        p["structured_output_only"] = json!(structured);
+        p["completion_tool"] = json!(tool);
         invalid.push(p);
     }
     let mut p = policy(34567);
@@ -613,5 +619,159 @@ async fn restricted_agent_callback_errors_are_bounded_and_redacted() -> Result<(
     server.abort();
     bridge.abort();
     host.shutdown().await?;
+    Ok(())
+}
+
+struct CompletionProvider {
+    calls: AtomicUsize,
+    first_request: tokio::sync::Notify,
+    release_first: tokio::sync::Notify,
+    second_request: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl AgentProvider for CompletionProvider {
+    async fn complete_turn(&self, request: ProviderTurnRequest) -> Result<ProviderTurnResponse> {
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, "fixture_record_lookup");
+        let additional_source = format!("{:?}", request.conversation).contains("fixture-second-origin");
+        if additional_source {
+            return StubProvider::new("processed second source independently").complete_turn(request).await;
+        }
+        if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+            self.second_request.notify_one();
+            return std::future::pending().await;
+        }
+        self.first_request.notify_one();
+        self.release_first.notified().await;
+        let mut response = StubProvider::new("prose beside the submission")
+            .complete_turn(request)
+            .await?;
+        response.blocks.push(ModelBlock::ToolUse {
+            id: "fixture-submission".into(),
+            name: "fixture_record_lookup".into(),
+            input: json!({"id":"synthetic"}),
+            kind: ModelToolCallKind::Function,
+            provider_data: None,
+        });
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn accepted_restricted_output_settles_and_can_be_archived() -> Result<()> {
+    for (bridge_receipt, compact) in [(true, false), (false, false), (true, true), (false, true)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let app = axum::Router::new().route(
+            "/call",
+            axum::routing::post(move |headers: axum::http::HeaderMap| async move {
+                assert_eq!(headers["authorization"], format!("Bearer {TOKEN}"));
+                // The false branch simulates a durable acceptance whose control bit
+                // did not reach the execution loop, so a second request is in flight.
+                axum::Json(json!({"ok":true,"complete_turn":bridge_receipt,
+                    "result":{"accepted":true,"complete_turn":true}}))
+            }),
+        );
+        let bridge = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let fixture = TestConfigBuilder::new().with_control_token("synthetic-control").build();
+        let provider = Arc::new(CompletionProvider {
+            calls: AtomicUsize::new(0),
+            first_request: Default::default(),
+            release_first: Default::default(),
+            second_request: Default::default(),
+        });
+        let host = RuntimeHost::new_with_provider(fixture.config().clone(), provider.clone())?;
+        let (base, server) = spawn_server_for_host(host.clone()).await?;
+        host.spawn_daemon_deletion_coordinator();
+        let client = reqwest::Client::new();
+        client.post(format!("{base}/api/control/agents/fixture-anchor/create"))
+            .bearer_auth("synthetic-control")
+            .json(&json!({"default_initial_message":false}))
+            .send().await?.error_for_status()?;
+        ready(&client, &base, "fixture-anchor").await?;
+        let control = format!("{base}/api/control/agents/completion");
+        let mut tools = policy(port);
+        tools["structured_output_only"] = json!(true);
+        tools["completion_tool"] = json!("fixture_record_lookup");
+        if compact {
+            tools["compact_system_prompt"] = json!(true);
+        }
+        client.post(format!("{control}/restricted/create"))
+            .bearer_auth("synthetic-control")
+            .json(&json!({"default_initial_message":false,"tool_allowlist":tools}))
+            .send().await?.error_for_status()?;
+        ready(&client, &base, "completion").await?;
+        let runtime = host.get_public_agent("completion").await?;
+        let first: Value = client.post(format!("{control}/prompt")).bearer_auth("synthetic-control")
+            .json(&json!({"text":"Submit synthetic output","client_request_id":"fixture-request","expected_incarnation":1}))
+            .send().await?.error_for_status()?.json().await?;
+        tokio::time::timeout(Duration::from_secs(10), provider.first_request.notified()).await?;
+        let second: Value = client.post(format!("{control}/prompt")).bearer_auth("synthetic-control")
+            .json(&json!({"text":"fixture-second-origin","client_request_id":"fixture-second-request","expected_incarnation":1}))
+            .send().await?.error_for_status()?.json().await?;
+        let first_id = first["message_id"].as_str().unwrap();
+        let second_id = second["message_id"].as_str().unwrap();
+        provider.release_first.notify_one();
+        if !bridge_receipt {
+            tokio::time::timeout(Duration::from_secs(10), provider.second_request.notified()).await?;
+            let cancel = |key: &str, incarnation: u64, complete: bool| {
+                client.post(format!("{control}/prompt-cancel")).bearer_auth("synthetic-control")
+                    .header("x-holon-expected-incarnation", incarnation.to_string())
+                    .json(&json!({"client_request_id":key,"complete_structured_output":complete}))
+            };
+            assert!(cancel("fixture-other", 1, true).send().await?.status().is_client_error());
+            assert_eq!(cancel("fixture-request", 2, true).send().await?.status(), 409);
+            let ordinary: Value = cancel("fixture-request", 1, false).send().await?.error_for_status()?.json().await?;
+            assert_eq!(ordinary["status"], "already_claimed");
+            assert!(runtime.agent_state().await?.current_run_id.is_some());
+            let accepted: Value = cancel("fixture-request", 1, true).send().await?.error_for_status()?.json().await?;
+            assert_eq!(accepted["status"], "already_claimed");
+        }
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let state = runtime.agent_state().await?;
+            let turns = runtime.storage().read_recent_turns(5)?;
+            let first_turn = turns.iter().find(|turn| turn.input_message_ids.iter().any(|id| id == first_id));
+            let second_turn = turns.iter().find(|turn| turn.input_message_ids.iter().any(|id| id == second_id));
+            if let (None, Some(first_turn), Some(second_turn)) = (state.current_run_id, first_turn, second_turn) {
+                assert_eq!(first_turn.input_message_ids, [first_id]);
+                assert_eq!(second_turn.input_message_ids, [second_id]);
+                assert_ne!(first_turn.turn_id, second_turn.turn_id);
+                assert!(state.current_execution_binding.is_none());
+                assert!(state.current_turn_id.is_none());
+                let terminal = first_turn.terminal.as_ref().unwrap();
+                assert_eq!(terminal.kind, holon::types::TurnTerminalKind::Completed);
+                assert_eq!(terminal.no_brief_reason, Some(holon::types::TurnNoBriefReason::StructuredOutputOnly));
+                let settled: bool = host.runtime_db().transaction(|tx| Ok(tx.query_row(
+                    "SELECT result_settled FROM conversation_turn_revisions WHERE agent_id='completion' AND turn_id=?1",
+                    [&first_turn.turn_id], |row| row.get(0))?))?;
+                assert!(settled);
+                break;
+            }
+            ensure!(Instant::now() < deadline, "submitted turn did not settle");
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), if bridge_receipt { 1 } else { 2 });
+        client.post(format!("{control}/stop-if-incarnation")).bearer_auth("synthetic-control")
+            .json(&json!({"expected_incarnation":1})).send().await?.error_for_status()?;
+        client.delete(&control).bearer_auth("synthetic-control")
+            .json(&json!({"archive":true,"expected_incarnation":1})).send().await?.error_for_status()?;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let deletion: Value = client.get(format!("{control}/delete-status"))
+                .bearer_auth("synthetic-control").send().await?.error_for_status()?.json().await?;
+            if deletion["job"]["status"] == "completed" {
+                assert_eq!(deletion["identity"]["status"], "deleted");
+                assert_eq!(deletion["identity"]["incarnation"], 1);
+                break;
+            }
+            ensure!(Instant::now() < deadline, "reclamation did not finish");
+            sleep(Duration::from_millis(20)).await;
+        }
+        bridge.abort();
+        server.abort();
+        host.shutdown().await?;
+    }
     Ok(())
 }

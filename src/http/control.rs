@@ -1230,7 +1230,7 @@ pub async fn restricted_agent_capabilities(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     authorize_control(&headers, &state).map_err(authentication_error_response)?;
-    Ok(Json(json!({"toolAllowlist": true, "promptCancellation": true, "structuredOutputOnly": true, "compactSystemPrompt": true})))
+    Ok(Json(json!({"toolAllowlist": true, "promptCancellation": true, "structuredOutputOnly": true, "compactSystemPrompt": true, "structuredToolCompletion": true})))
 }
 
 pub async fn create_agent(

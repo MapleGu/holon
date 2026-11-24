@@ -8701,3 +8701,4 @@ mod conditional_work_item_tests;
 
 #[path = "runtime/structured_turn_settlement.rs"]
 pub(crate) mod structured_turn_settlement;
+mod structured_tool_completion;

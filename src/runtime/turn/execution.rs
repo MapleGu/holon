@@ -560,6 +560,31 @@ impl RuntimeHandle {
         })
     }
 
+    pub(in crate::runtime) async fn completed_structured_tool_outcome(
+        &self,
+        duration_ms: u64,
+    ) -> Result<AgentLoopOutcome> {
+        let terminal = self.persist_turn_terminal_record(
+            TurnTerminalKind::Completed, None, Some(TurnNoBriefReason::StructuredOutputOnly),
+            duration_ms, None, false,
+        ).await?;
+        Ok(AgentLoopOutcome {
+            final_text: String::new(),
+            final_citations: Vec::new(),
+            final_text_source_assistant_round_id: None,
+            turn_index: terminal.turn_index,
+            terminal,
+            should_sleep: true,
+            sleep_duration_ms: None,
+            allow_sleep_runnable_work_override: false,
+            terminal_kind: TurnTerminalKind::Completed,
+            prepared_work_item_completion: None,
+            prepared_wait_for: None,
+            provider_recovery_message: None,
+            terminal_tool_executions: Vec::new(),
+        })
+    }
+
     async fn maybe_finish_caller_owned_provider_failure(
         &self,
         caller_retries: bool,
@@ -1595,8 +1620,10 @@ impl RuntimeHandle {
     ) -> Result<OperatorInterjectionPlan> {
         use crate::types::ExecutionAdmissionProvenance;
 
-        // Bounded structured turns keep other sources queued for their own claim.
-        if self.bounded_compact_turn(expected_state)? {
+        // Keep other sources queued for their own claim when the turn requires a single source.
+        if self.bounded_compact_turn(expected_state)?
+            || self.structured_completion_isolates_input(expected_state)?
+        {
             return Ok(OperatorInterjectionPlan::RetainSource);
         }
 
@@ -3930,6 +3957,7 @@ impl RuntimeHandle {
                 all_tool_results_should_sleep = false;
             }
             let mut terminal_tool_transition = false;
+            let mut completed_structured_output = false;
             let mut execution_terminal_transition_seen = false;
             for (tool_call_index, call) in tool_calls.into_iter().enumerate() {
                 if let Err(err) = runtime.ensure_not_aborted().await {
@@ -4479,6 +4507,10 @@ impl RuntimeHandle {
                             is_error: result.is_error(),
                             error: result.tool_error().cloned(),
                         });
+                        if matches!(loop_directive, Some(crate::tool::spec::ToolLoopDirective::CompleteStructuredOutput)) {
+                            completed_structured_output = true;
+                            break;
+                        }
                         execution_terminal_transition_seen |= result.terminal_transition;
                         if matches!(
                             loop_directive,
@@ -4700,6 +4732,7 @@ impl RuntimeHandle {
                 || pending_wait_report.is_some()
                 || prepared_work_item_completion.is_some()
                 || execution_terminal_transition_seen
+                || completed_structured_output
             {
                 Vec::new()
             } else {
@@ -4746,6 +4779,13 @@ impl RuntimeHandle {
                     checkpoint_state.anchor_generation.saturating_add(1);
             }
             completed_rounds.push(round_record);
+
+            if completed_structured_output {
+                let outcome = runtime.completed_structured_tool_outcome(
+                    turn_started_at.elapsed().as_millis() as u64,
+                ).await?;
+                return Ok(ProviderResponseControl::Terminal(outcome));
+            }
 
             if wait_report_error_delivered {
                 return Ok(ProviderResponseControl::Continue);

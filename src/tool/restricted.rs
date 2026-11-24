@@ -19,6 +19,8 @@ pub struct ToolAllowlist {
     structured_output_only: bool,
     #[serde(skip_serializing_if = "is_false")]
     compact_system_prompt: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_tool: Option<String>,
 }
 impl std::fmt::Debug for ToolAllowlist {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,6 +53,7 @@ impl<'de> Deserialize<'de> for ToolAllowlist {
             structured_output_only: bool,
             #[serde(default)]
             compact_system_prompt: bool,
+            completion_tool: Option<String>,
         }
         let wire =
             Wire::deserialize(d).map_err(|_| serde::de::Error::custom("invalid tool_allowlist"))?;
@@ -61,6 +64,7 @@ impl<'de> Deserialize<'de> for ToolAllowlist {
                 bridge: wire.bridge,
                 structured_output_only: wire.structured_output_only,
                 compact_system_prompt: wire.compact_system_prompt,
+                completion_tool: wire.completion_tool,
             };
             policy.validate()?;
             Ok(policy)
@@ -77,6 +81,10 @@ impl ToolAllowlist {
         self.structured_output_only
     }
 
+    pub(crate) fn completion_tool(&self) -> Option<&str> {
+        self.completion_tool.as_deref()
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         let valid = || -> Result<()> {
             ensure!(serde_json::to_vec(self)?.len() <= MAX_IO, "size");
@@ -86,6 +94,10 @@ impl ToolAllowlist {
                     || (self.structured_output_only && self.tools.len() == 1),
                 "compact requires structured output and one tool"
             );
+            if let Some(tool) = self.completion_tool() {
+                ensure!(self.structured_output_only, "structured output required");
+                self.check(tool)?;
+            }
             let prefix = self.tool_name_prefix.as_bytes();
             ensure!(
                 (2..=63).contains(&prefix.len())
@@ -222,11 +234,14 @@ impl ToolAllowlist {
                 reply.get("ok") == Some(&Value::Bool(true)) && reply.get("result").is_some(),
                 "reply"
             );
-            Ok::<_, anyhow::Error>(ToolResult::success(
-                &call.name,
-                reply["result"].clone(),
-                None,
-            ))
+            let mut result = ToolResult::success(&call.name, reply["result"].clone(), None);
+            // The authenticated bridge's outer receipt is separate from tool input and output.
+            if self.completion_tool() == Some(call.name.as_str())
+                && reply.get("complete_turn") == Some(&Value::Bool(true))
+            {
+                result.loop_directive = Some(super::spec::ToolLoopDirective::CompleteStructuredOutput);
+            }
+            Ok::<_, anyhow::Error>(result)
         };
         // Never return provider bodies, transport errors, URL, or credentials.
         Ok(match send.await {

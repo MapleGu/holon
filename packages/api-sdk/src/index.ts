@@ -142,6 +142,14 @@ export interface RestrictedToolAllowlist {
   readonly bridge: RestrictedToolBridge;
   readonly structured_output_only?: true;
   readonly compact_system_prompt?: true;
+  /** Opt-in exact registered terminal submit tool; requires structured_output_only. */
+  readonly completion_tool?: string;
 }
 
 export const conditionalWorkItemCapabilitiesPath = "/control/runtime/conditional-work-item-capabilities";
+
+/** Authenticated exact-owner prompt cancellation; completion is an opt-in restricted turn contract. */
+export interface RestrictedPromptCancellation {
+  readonly client_request_id: string;
+  readonly complete_structured_output?: true;
+}

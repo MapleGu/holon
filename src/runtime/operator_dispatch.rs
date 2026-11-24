@@ -335,8 +335,12 @@ impl RuntimeHandle {
             .await?;
         let live_recovered = provider_inputs_recovered
             || Box::pin(self.recover_interrupted_live_inputs(message)).await?;
-        let mut idle_results_checked = live_recovered;
-        let mut idle_batch_checked = live_recovered;
+        let isolate_sources = {
+            let guard = self.inner.agent.lock().await;
+            self.structured_completion_isolates_input(&guard.state)?
+        };
+        let mut idle_results_checked = live_recovered || isolate_sources;
+        let mut idle_batch_checked = live_recovered || isolate_sources;
         let built = loop {
             // Idle ACKs can replace Work's publication. Re-enter the explicit
             // preparation barrier before capturing another pure Context view.
@@ -392,7 +396,7 @@ impl RuntimeHandle {
             context_build_started_at,
             message,
         );
-        let mut outcome = self
+        let outcome = self
             .run_agent_loop_deferred(
                 &message.agent_id,
                 message.authority_class.clone(),
@@ -401,7 +405,21 @@ impl RuntimeHandle {
                 loop_control,
                 trace_context.clone(),
             )
-            .await?;
+            .await;
+        let mut outcome = match outcome {
+            Err(error) if error.downcast_ref::<CurrentRunAborted>().is_some_and(|abort| {
+                abort.reason == super::structured_tool_completion::ACCEPTED_OUTPUT_ABORT
+            }) => {
+                let abort = error.downcast_ref::<CurrentRunAborted>().expect("checked abort");
+                anyhow::ensure!(run_id.as_deref() == Some(abort.run_id.as_str())
+                    && self.is_standalone_structured_turn(Some(&message.id), Some(&dispatch_turn_id)).await?,
+                    "structured output completion no longer owns the turn");
+                self.completed_structured_tool_outcome(
+                    context_build_started.elapsed().as_millis() as u64,
+                ).await?
+            },
+            result => result?,
+        };
         #[cfg(all(test, holon_lib_test_shard = "d"))]
         self.check_operator_dispatch_reader_failure(true)?;
         crate::diagnostics::record_turn_total(context_build_started.elapsed());

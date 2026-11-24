@@ -111,6 +111,18 @@ impl CancelScope {
         }
         Ok(record)
     }
+    pub(crate) fn claimed_message(&self, c: &Connection) -> Result<String> {
+        self.validate(c)?;
+        let record = self.exact(c)?.ok_or_else(unavailable)?;
+        ensure!(
+            record.outcome == AgentMessageDeliveryOutcome::Accepted
+                && record.accepted_at.is_some()
+                && matches!(record.state, AgentMessageDeliveryState::Dispatched | AgentMessageDeliveryState::Consumed),
+            unavailable()
+        );
+        record.message_id.ok_or_else(unavailable)
+    }
+
     pub(crate) fn plan_tx(&self, tx: &Transaction<'_>) -> Result<CancelPlan> {
         self.validate(tx)?;
         if let Some(status) = self.receipt(tx)? {
