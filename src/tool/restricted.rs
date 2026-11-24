@@ -12,6 +12,7 @@ pub struct ToolAllowlist {
     tool_name_prefix: String,
     tools: Vec<RegisteredTool>,
     bridge: Bridge,
+    structured_output_only: bool,
 }
 impl std::fmt::Debug for ToolAllowlist {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,6 +41,8 @@ impl<'de> Deserialize<'de> for ToolAllowlist {
             tool_name_prefix: String,
             tools: Vec<RegisteredTool>,
             bridge: Bridge,
+            #[serde(default)]
+            structured_output_only: bool,
         }
         let wire =
             Wire::deserialize(d).map_err(|_| serde::de::Error::custom("invalid tool_allowlist"))?;
@@ -48,6 +51,7 @@ impl<'de> Deserialize<'de> for ToolAllowlist {
                 tool_name_prefix: wire.tool_name_prefix,
                 tools: wire.tools,
                 bridge: wire.bridge,
+                structured_output_only: wire.structured_output_only,
             };
             policy.validate()?;
             Ok(policy)
@@ -56,6 +60,10 @@ impl<'de> Deserialize<'de> for ToolAllowlist {
     }
 }
 impl ToolAllowlist {
+    pub(crate) fn structured_output_only(&self) -> bool {
+        self.structured_output_only
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         let valid = || -> Result<()> {
             ensure!(serde_json::to_vec(self)?.len() <= MAX_IO, "size");
@@ -433,6 +441,19 @@ pub(crate) fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn structured_output_only_requires_explicit_policy_opt_in() {
+        let mut value = json!({"tool_name_prefix":"fixture_","tools":[],"bridge":{"url":"http://127.0.0.1:34567/call","bearer":"synthetic-structured-output"}});
+        let ordinary: ToolAllowlist = serde_json::from_value(value.clone()).unwrap();
+        assert!(!ordinary.structured_output_only());
+        value["structured_output_only"] = json!(true);
+        let opted_in: ToolAllowlist = serde_json::from_value(value.clone()).unwrap();
+        assert!(opted_in.structured_output_only());
+        assert_eq!(serde_json::to_value(opted_in).unwrap(), value);
+        value["structured_output_only"] = json!("true");
+        assert!(serde_json::from_value::<ToolAllowlist>(value).is_err());
+    }
+
     #[test]
     fn restricted_wire_redacts_and_rejects_malformed() {
         let valid = json!({"tool_name_prefix":"fixture_","tools":[{"name":"fixture_test","description":"test","parameters":{"type":"object"}}],"bridge":{"url":"http://127.0.0.1:34567/call","bearer":"synthetic-ephemeral-0007"}});

@@ -441,6 +441,21 @@ impl RuntimeHandle {
             {
                 outcome.terminal.no_brief_reason = Some(TurnNoBriefReason::ToolOnlyWait);
             }
+        } else if outcome.terminal_kind == TurnTerminalKind::Completed
+            && message.kind == MessageKind::OperatorPrompt
+            && message.delivery_surface == Some(MessageDeliverySurface::HttpControlPrompt)
+            && message.work_item_id.is_none()
+            && operator_binding_id.is_none()
+            && operator_reply_route_id.is_none()
+            && outcome.provider_recovery_message.is_none()
+            && self
+                .restricted_tool_allowlist()
+                .await?
+                .is_some_and(|policy| policy.structured_output_only())
+        {
+            // The authenticated caller selected structured output via its tool bridge.
+            // Assistant prose remains in the transcript; no conversation Brief is due.
+            outcome.terminal.no_brief_reason = Some(TurnNoBriefReason::StructuredOutputOnly);
         } else if outcome.terminal_kind.is_failure() {
             let mut brief =
                 brief::make_failure(&message.agent_id, message, outcome.final_text.clone());

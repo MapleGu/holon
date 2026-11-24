@@ -132,6 +132,7 @@ fn canonical_conversation_cells(
                         "No canonical result: turn interrupted".to_owned()
                     }
                     NoBriefReason::ToolOnlyWait => "No canonical result: tool-only wait".to_owned(),
+                    NoBriefReason::StructuredOutputOnly => "Structured output only".to_owned(),
                 }),
                 (_, TerminalOutcome::Completed) => None,
                 _ => Some(format!("Turn ended: {outcome:?}")),

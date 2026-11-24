@@ -160,6 +160,11 @@ impl WorkItemMutation {
 pub(crate) enum QueueMutation {
     Consume(QueueEntryRecord),
     Upsert(QueueEntryRecord),
+    SettleStructuredHttp {
+        record: QueueEntryRecord,
+        attempt_id: String,
+        turn_id: String,
+    },
     SettleWithProviderRecovery {
         record: QueueEntryRecord,
         recovery: Box<MessageEnvelope>,
@@ -3207,6 +3212,7 @@ impl RuntimeTransitionRepository<'_> {
             let message_id = match &command.mutation {
                 QueueMutation::Consume(record)
                 | QueueMutation::Upsert(record)
+                | QueueMutation::SettleStructuredHttp { record, .. }
                 | QueueMutation::SettleWithProviderRecovery { record, .. }
                 | QueueMutation::CompareAndSet { record, .. }
                 | QueueMutation::ParkProviderDispatch { record, .. }
@@ -3914,6 +3920,7 @@ impl RuntimeTransitionRepository<'_> {
                     }
                 },
                 QueueMutation::Upsert(record)
+                | QueueMutation::SettleStructuredHttp { record, .. }
                 | QueueMutation::SettleWithProviderRecovery { record, .. } => {
                     super::repositories::upsert_queue_entry_with_audits_tx(
                         tx,
@@ -3937,7 +3944,7 @@ impl RuntimeTransitionRepository<'_> {
         };
         if !matches!(
             &command.mutation,
-            QueueMutation::Upsert(_) | QueueMutation::SettleWithProviderRecovery { .. }
+            QueueMutation::Upsert(_) | QueueMutation::SettleStructuredHttp { .. } | QueueMutation::SettleWithProviderRecovery { .. }
         ) && !mutation_applied
         {
             return Ok(TransitionCommit {
@@ -4229,6 +4236,9 @@ impl RuntimeTransitionRepository<'_> {
         }
         for brief in &command.brief_evidence {
             insert_brief_evidence_tx(tx, brief)?;
+        }
+        if let Some(turn) = command.turn_record.as_ref() {
+            settle_released_http_turn_tx(tx, command, turn)?;
         }
         // Attempt/Turn settlements must be durable before retiring their wake.
         if synchronize_timer_wakes {
@@ -6274,6 +6284,15 @@ fn validate_queue_mutation_tx(tx: &Transaction<'_>, mutation: &QueueMutation) ->
         .optional()?
         .map(|payload| serde_json::from_str::<QueueEntryRecord>(&payload))
         .transpose()?;
+    if let QueueMutation::SettleStructuredHttp { record, attempt_id, .. } = mutation {
+        use crate::domain::execution_protocol::ExecutionAttemptState;
+        let execution = execution_protocol_repository::load_state_tx(tx, &record.agent_id)?;
+        anyhow::ensure!(existing.as_ref().is_some_and(|entry| entry.status == QueueEntryStatus::Dequeued)
+            && execution.attempts.get(attempt_id).is_some_and(|attempt|
+                attempt.state == ExecutionAttemptState::Open
+                    && attempt.source_message_id.as_deref() == Some(record.message_id.as_str())),
+            "structured HTTP settlement lost its original open attempt");
+    }
     if let QueueMutation::ParkProviderDispatch {
         expected,
         pause,
@@ -6317,6 +6336,7 @@ fn validate_queue_mutation_tx(tx: &Transaction<'_>, mutation: &QueueMutation) ->
     match (mutation, existing.as_ref()) {
         (
             QueueMutation::Upsert(_)
+            | QueueMutation::SettleStructuredHttp { .. }
             | QueueMutation::SettleWithProviderRecovery { .. }
             | QueueMutation::ParkProviderDispatch { .. },
             Some(existing),
@@ -6341,7 +6361,8 @@ fn queue_mutation_record(mutation: &QueueMutation) -> &QueueEntryRecord {
     match mutation {
         QueueMutation::Consume(record) | QueueMutation::Upsert(record) => record,
         QueueMutation::CompareAndSet { record, .. }
-        | QueueMutation::SettleWithProviderRecovery { record, .. }
+        | QueueMutation::SettleStructuredHttp { record, .. }
+                | QueueMutation::SettleWithProviderRecovery { record, .. }
         | QueueMutation::ConsumeSettledTaskResultRecovery { record, .. }
         | QueueMutation::ParkProviderDispatch { record, .. } => record,
     }
@@ -6439,6 +6460,20 @@ fn validate_delivery_queue_admission(
 }
 
 fn validate_queue_operation(command: &QueueTransitionCommand) -> Result<()> {
+    if let QueueMutation::SettleStructuredHttp { record, attempt_id, turn_id } = &command.mutation {
+        anyhow::ensure!(command.operation == QueueOperation::Settle
+            && matches!(record.status, QueueEntryStatus::Processed | QueueEntryStatus::Aborted)
+            && record.agent_id == command.agent_id
+            && command.message_evidence.is_empty()
+            && command.turn_record.as_ref().is_some_and(|turn| turn.turn_id == *turn_id)
+            && command.agent_state.as_ref().and_then(|mutation| mutation.expected.as_deref())
+                .and_then(|state| state.current_execution_binding.as_ref())
+                .is_some_and(|binding| binding.activation_id.as_deref() == Some(attempt_id.as_str())
+                    && binding.turn_id == *turn_id && binding.source_message_id == record.message_id),
+            "invalid explicit structured HTTP settlement");
+        return Ok(());
+    }
+
     if let QueueMutation::SettleWithProviderRecovery { record, recovery } = &command.mutation {
         let turn = command
             .turn_record
@@ -11681,3 +11716,133 @@ mod tests {
 #[cfg(test)]
 #[path = "transition_wait_footprint_tests.rs"]
 mod wait_footprint_tests;
+
+// A terminal Brief is a result only after the original execution releases it.
+// The queue/state CAS and canonical attempt transition above fence competing writers.
+fn settle_released_http_turn_tx(
+    tx: &Transaction<'_>,
+    command: &QueueTransitionCommand,
+    turn: &TurnRecord,
+) -> Result<()> {
+    let QueueMutation::SettleStructuredHttp {
+        record,
+        attempt_id,
+        turn_id,
+    } = &command.mutation
+    else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        turn.turn_id == *turn_id && turn.agent_id == record.agent_id,
+        "structured HTTP turn identity changed"
+    );
+    let Some(mutation) = command.agent_state.as_ref() else {
+        return Ok(());
+    };
+    let Some(original) = mutation.expected.as_deref() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        original
+            .current_execution_binding
+            .as_ref()
+            .is_some_and(|binding| binding.activation_id.as_deref() == Some(attempt_id.as_str())),
+        "structured HTTP attempt identity changed"
+    );
+    let released = &mutation.record;
+    if original.current_execution_binding.is_none()
+        || released.current_execution_binding.is_some()
+        || released.current_turn_id.is_some()
+        || released.current_run_id.is_some()
+        || released.current_turn_work_item_id.is_some()
+    {
+        anyhow::bail!("structured HTTP settlement did not release its exact execution");
+    }
+    let source = turn
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.message_id.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("released HTTP turn has no source"))?;
+    let mut checked = original.clone();
+    anyhow::ensure!(
+        crate::runtime::structured_turn_settlement::release_exact_turn(
+            original,
+            &mut checked,
+            turn,
+            source
+        ),
+        "released HTTP turn completion fence is stale"
+    );
+    let message: String = tx.query_row(
+        "SELECT payload_json FROM messages WHERE agent_id=?1 AND message_id=?2",
+        rusqlite::params![turn.agent_id, source],
+        |row| row.get(0),
+    )?;
+    let message: crate::types::MessageEnvelope = serde_json::from_str(&message)?;
+    anyhow::ensure!(
+        message.kind == crate::types::MessageKind::OperatorPrompt
+            && message.delivery_surface
+                == Some(crate::types::MessageDeliverySurface::HttpControlPrompt)
+            && message.work_item_id == turn.current_work_item_id,
+        "released HTTP turn source mismatch"
+    );
+    let terminal = turn
+        .terminal
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("released HTTP turn is not terminal"))?;
+    if terminal.no_brief_reason == Some(crate::types::TurnNoBriefReason::StructuredOutputOnly) {
+        anyhow::ensure!(
+            terminal.kind == TurnTerminalKind::Completed
+                && turn.current_work_item_id.is_none()
+                && turn.produced_brief_ids.is_empty(),
+            "only standalone structured success may omit its Brief"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        terminal.no_brief_reason.is_none(),
+        "structured HTTP terminal has an incompatible no-Brief reason"
+    );
+    let expected_kind = if terminal.kind == TurnTerminalKind::Completed {
+        crate::types::BriefKind::Result
+    } else if matches!(
+        terminal.kind,
+        TurnTerminalKind::BaselineOverBudget | TurnTerminalKind::ProviderFailedNeedsRecovery
+    ) {
+        crate::types::BriefKind::Failure
+    } else {
+        anyhow::bail!("cancellation cannot settle a released HTTP turn");
+    };
+    let mut matching = 0;
+    for id in &turn.produced_brief_ids {
+        let payload: String = tx.query_row(
+            "SELECT payload_json FROM briefs WHERE agent_id=?1 AND evidence_id=?2",
+            rusqlite::params![turn.agent_id, id],
+            |row| row.get(0),
+        )?;
+        let brief: crate::types::BriefRecord = serde_json::from_str(&payload)?;
+        anyhow::ensure!(
+            brief.agent_id == turn.agent_id
+                && brief.turn_id.as_deref() == Some(turn.turn_id.as_str())
+                && brief.related_message_id.as_deref() == Some(source)
+                && brief.work_item_id == turn.current_work_item_id,
+            "released HTTP turn Brief identity mismatch"
+        );
+        matching += usize::from(brief.kind == expected_kind);
+    }
+    anyhow::ensure!(
+        matching == 1,
+        "released HTTP turn requires one exact terminal Brief"
+    );
+    super::conversation::settle_turn_result_tx(
+        tx,
+        &turn.agent_id,
+        &turn.turn_id,
+        terminal.completed_at,
+    )?;
+    Ok(())
+}
+
+#[cfg(all(test, holon_lib_test_shard = "c"))]
+#[path = "transitions/structured_http_tests.rs"]
+mod structured_http_tests;

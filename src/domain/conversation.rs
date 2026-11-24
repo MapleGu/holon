@@ -234,6 +234,7 @@ pub enum NoBriefReason {
     Aborted,
     Interrupted,
     ToolOnlyWait,
+    StructuredOutputOnly,
 }
 
 impl From<&TurnNoBriefReason> for NoBriefReason {
@@ -245,6 +246,7 @@ impl From<&TurnNoBriefReason> for NoBriefReason {
             TurnNoBriefReason::Aborted => Self::Aborted,
             TurnNoBriefReason::Interrupted => Self::Interrupted,
             TurnNoBriefReason::ToolOnlyWait => Self::ToolOnlyWait,
+            TurnNoBriefReason::StructuredOutputOnly => Self::StructuredOutputOnly,
         }
     }
 }

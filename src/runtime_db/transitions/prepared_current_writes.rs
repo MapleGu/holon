@@ -52,6 +52,7 @@ pub(super) fn visit_original(
             let record = match &queue.command.mutation {
                 QueueMutation::Consume(record) | QueueMutation::Upsert(record) => record,
                 QueueMutation::CompareAndSet { record, .. }
+                | QueueMutation::SettleStructuredHttp { record, .. }
                 | QueueMutation::SettleWithProviderRecovery { record, .. }
                 | QueueMutation::ParkProviderDispatch { record, .. }
                 | QueueMutation::ConsumeSettledTaskResultRecovery { record, .. } => record,

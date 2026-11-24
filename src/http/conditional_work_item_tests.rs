@@ -654,3 +654,272 @@ async fn issue134_real_http_followup_idle_proof_exact_brief_complete_and_get() {
     server.await.unwrap();
     host.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn issue160_work_bound_structured_turn_settles_with_exact_result_while_work_open() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_home, initial) = tests::control_token_test_host();
+    let mut config = initial.config().as_ref().clone();
+    config.default_agent_id = "synthetic-default-anchor".into();
+    initial.shutdown().await.unwrap();
+    drop(initial);
+    let provider = Arc::new(HttpFollowUpTextProvider(AtomicUsize::new(0)));
+    let host = RuntimeHost::new_with_provider(config.clone(), provider.clone()).unwrap();
+    let (_, startup) = host
+        .recover_startup_deferred_observed(&crate::startup::StartupObservation::new())
+        .await
+        .unwrap();
+    let policy: crate::tool::restricted::ToolAllowlist = serde_json::from_value(json!({"structured_output_only":true,"tool_name_prefix":"fixture_","tools":[],"bridge":{"url":"http://127.0.0.1:9/call","bearer":"synthetic-closed-http-bridge-134"}})).unwrap();
+    host.create_restricted_agent("synthetic-default-anchor", None, None, false, policy.clone()).await.unwrap();
+    assert_eq!(host.config().default_agent_id, "synthetic-default-anchor");
+    let created = host
+        .create_restricted_agent("synthetic-http-source", None, None, false, policy)
+        .await
+        .unwrap();
+    let incarnation = created.identity.incarnation;
+    assert_ne!(created.identity.agent_id, host.config().default_agent_id);
+    let (base, stop, server) = serve_follow_up_http(host.clone()).await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let control = "/control/agents/synthetic-http-source/work-items";
+    let work = follow_up_http_json(&client, &base, "POST", control, None,
+        Some(json!({"objective":"synthetic HTTP verification follow-up", "expected_incarnation":incarnation}))).await;
+    let id = work["id"].as_str().unwrap().to_string();
+    follow_up_http_json(
+        &client,
+        &base,
+        "POST",
+        &format!("{control}/{id}/wait"),
+        None,
+        Some(json!({"reason":"synthetic event only", "expected_incarnation":incarnation})),
+    )
+    .await;
+    startup.release();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    host.shutdown().await.unwrap();
+    drop(host);
+
+    let host = RuntimeHost::new_with_provider(config, provider.clone()).unwrap();
+    host.recover_orphaned_queue_claims_at_startup()
+        .await
+        .unwrap();
+    let (base, stop, server) = serve_follow_up_http(host.clone()).await;
+    let read_path = format!("/agents/synthetic-http-source/work-items/{id}");
+    let open =
+        follow_up_http_json(&client, &base, "GET", &read_path, Some(incarnation), None).await;
+    assert_eq!(open["state"], "open");
+    assert_eq!(open["blocked_by"], "synthetic event only");
+    assert!(open["recheck_at"].is_null());
+    assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+    let prompt = follow_up_http_json(&client, &base, "POST", "/control/agents/synthetic-http-source/prompt", None,
+        Some(json!({"text":"synthetic verified event evidence; return completion JSON as plain text", "work_item_id":id,
+            "expected_incarnation":incarnation, "client_request_id":"synthetic-http-follow-up-event-134"}))).await;
+    assert_eq!(prompt["disposition"], "accepted");
+    let message = prompt["message_id"].as_str().unwrap();
+    let locate_path = "/agents/synthetic-http-source/conversation/locate";
+    let last_locate = std::sync::Mutex::new(Value::Null);
+    let turn = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let located = follow_up_http_json(
+                &client,
+                &base,
+                "POST",
+                locate_path,
+                Some(incarnation),
+                Some(json!({"source_ref":format!("message:{message}")})),
+            )
+            .await;
+            *last_locate.lock().unwrap() = located.clone();
+            if located["status"] == "located" && located["target"]["kind"] == "input_message" {
+                assert_eq!(located["target"]["message_id"], message);
+                let turn_id = &located["target"]["turn_id"];
+                if let Some(turn) =
+                    located["window"]["turns"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|turn| {
+                            &turn["turn_id"] == turn_id
+                                && turn["inputs"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|input| input["message_id"] == message)
+                        })
+                {
+                    if turn["execution"]["kind"] == "terminal"
+                        && !turn["completed_at"].is_null()
+                    {
+                        if turn["settled"] == true { break turn.clone(); }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| panic!("HTTP locateSource qualification failed: {error}; calls={}; last={}; state={:?}; events={:?}", provider.0.load(Ordering::SeqCst), last_locate.lock().unwrap(), host.agent_storage("synthetic-http-source").unwrap().read_agent(), host.agent_storage("synthetic-http-source").unwrap().read_recent_events(35)));
+    assert_eq!(
+        turn["execution"]["outcome"], "completed",
+        "actual terminal must satisfy Service qualification: {turn}"
+    );
+    assert_eq!(
+        turn["result"]["kind"], "available",
+        "actual result must satisfy Service qualification: {turn}"
+    );
+    assert_eq!(
+        turn["settled"], true,
+        "native exact terminal transaction must settle delivery"
+    );
+    let still_open = follow_up_http_json(&client, &base, "GET", &read_path, Some(incarnation), None).await;
+    assert_eq!(still_open["state"], "open", "turn completion must not complete durable Work");
+    assert_ne!(host.config().default_agent_id, "synthetic-http-source");
+    let identity_before_delete = host.agent_identity_record("synthetic-http-source").unwrap().unwrap();
+    let rejected = client.delete(format!("{base}/control/agents/synthetic-http-source"))
+        .bearer_auth("secret")
+        .json(&json!({"expected_incarnation":incarnation,"archive":true}))
+        .send().await.unwrap();
+    assert_eq!(rejected.status().as_u16(), 409, "open Work must fence conditional deletion even after its turn settled");
+    let rejection: Value = rejected.json().await.unwrap();
+    assert_eq!(rejection["code"], "agent_delete_blocked");
+    // HTTP rejection may reflect a legitimate future sleep. First prove that it
+    // preserved the holder, then use public Stop to isolate durable Work retention.
+    let after_http_rejection = follow_up_http_json(&client, &base, "GET", &read_path, Some(incarnation), None).await;
+    assert_eq!(after_http_rejection, still_open);
+    assert_eq!(host.agent_identity_record("synthetic-http-source").unwrap().unwrap(), identity_before_delete);
+    assert!(host.runtime_db().agent_deletions().latest_for_agent("synthetic-http-source").unwrap().is_none());
+    host.control_public_agent("synthetic-http-source", crate::types::ControlAction::Stop).await.unwrap();
+    let stopped = host.agent_storage("synthetic-http-source").unwrap().read_agent().unwrap().unwrap();
+    assert_eq!(stopped.status, crate::types::AgentStatus::Stopped);
+    assert!(stopped.current_run_id.is_none());
+    assert!(stopped.pending_wake_hint.is_none());
+    assert!(stopped.sleeping_until.is_none());
+    let after_stop = follow_up_http_json(&client, &base, "POST", locate_path, Some(incarnation),
+        Some(json!({"source_ref":format!("message:{message}")}))).await;
+    assert_eq!(after_stop["target"]["message_id"], message);
+    assert_eq!(after_stop["target"]["turn_id"], turn["turn_id"]);
+    let stopped_turn = after_stop["window"]["turns"].as_array().unwrap().iter()
+        .find(|candidate| candidate["turn_id"] == turn["turn_id"]).unwrap();
+    assert_eq!(stopped_turn["settled"], true);
+    assert_eq!(stopped_turn["execution"]["outcome"], "completed");
+    assert_eq!(stopped_turn["result"]["kind"], "available");
+    assert_eq!(stopped_turn["brief_ids"], turn["brief_ids"]);
+    let open_after_stop = follow_up_http_json(&client, &base, "GET", &read_path, Some(incarnation), None).await;
+    assert_eq!(open_after_stop, still_open);
+    let blocked = host.begin_public_agent_deletion_if_incarnation(
+        "synthetic-http-source", false, "synthetic issue160 retention proof", true, Some(incarnation),
+    ).await.unwrap_err();
+    let crate::host::PublicAgentError::Runtime(blocked) = blocked else {
+        panic!("expected native conditional deletion conflict: {blocked}");
+    };
+    let blocked = blocked.downcast_ref::<crate::tool::ToolError>().unwrap();
+    assert_eq!(blocked.kind, "agent_delete_blocked");
+    assert_eq!(blocked.details, Some(json!({"blocker":"open_work_item"})));
+
+    let after_rejected_delete = follow_up_http_json(&client, &base, "GET", &read_path, Some(incarnation), None).await;
+    assert_eq!(after_rejected_delete, still_open);
+    assert_eq!(host.agent_identity_record("synthetic-http-source").unwrap().unwrap(), identity_before_delete);
+    assert!(host.runtime_db().agent_deletions().latest_for_agent("synthetic-http-source").unwrap().is_none());
+    let brief_ids = turn["brief_ids"].as_array().unwrap();
+    assert!(!brief_ids.is_empty() && brief_ids.len() <= 8);
+    let mut exact = Vec::new();
+    for brief_id in brief_ids {
+        let brief = follow_up_http_json(
+            &client,
+            &base,
+            "GET",
+            &format!(
+                "/agents/synthetic-http-source/briefs/{}",
+                brief_id.as_str().unwrap()
+            ),
+            Some(incarnation),
+            None,
+        )
+        .await;
+        if brief["kind"] == "result"
+            && brief["agent_id"] == "synthetic-http-source"
+            && brief["work_item_id"] == id
+            && brief["turn_id"] == turn["turn_id"]
+        {
+            exact.push(brief);
+        }
+    }
+    assert_eq!(exact.len(), 1);
+    let text = exact[0]["text"].as_str().unwrap();
+    assert!(text.len() <= 512);
+    let report: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(report.as_object().unwrap().len(), 2);
+    assert_eq!(
+        report,
+        json!({"outcome":"completed","evidenceId":"synthetic-event-evidence-http-134"})
+    );
+    let completed = follow_up_http_json(&client, &base, "POST", &format!("{control}/{id}/complete"), None,
+        Some(json!({"expected_incarnation":incarnation,"report_text":"Verified verification follow-up completed using event evidence synthetic-event-evidence-http-134."}))).await;
+    assert_eq!(completed["state"], "completed");
+    let readback =
+        follow_up_http_json(&client, &base, "GET", &read_path, Some(incarnation), None).await;
+    assert_eq!(readback["id"], id);
+    assert_eq!(readback["agent_id"], "synthetic-http-source");
+    assert_eq!(readback["state"], "completed");
+    assert_eq!(readback["revision"], completed["revision"]);
+    eprintln!(
+        "followup_http_evidence: original_message={} original_turn={} raw_brief_id={} raw_brief_work={} raw_brief_turn={} settled={} completed_get={} incarnation={}",
+        message,
+        turn["turn_id"],
+        exact[0]["id"],
+        exact[0]["work_item_id"],
+        exact[0]["turn_id"],
+        turn["settled"],
+        readback["state"],
+        incarnation
+    );
+    assert!(provider.0.load(Ordering::SeqCst) >= 1);
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn issue160_standalone_timer_prompt_settles_without_brief() {
+    use std::sync::atomic::AtomicUsize;
+    let (_home, initial) = tests::control_token_test_host();
+    let config = initial.config().as_ref().clone();
+    initial.shutdown().await.unwrap();
+    let host = RuntimeHost::new_with_provider(config, Arc::new(HttpFollowUpTextProvider(AtomicUsize::new(0)))).unwrap();
+    let policy = serde_json::from_value(json!({"structured_output_only":true,"tool_name_prefix":"fixture_","tools":[],"bridge":{"url":"http://127.0.0.1:9/call","bearer":"synthetic-closed-bridge"}})).unwrap();
+    let created = host.create_restricted_agent("synthetic-http-source", None, None, false, policy).await.unwrap();
+    let incarnation = created.identity.incarnation;
+    let (base, stop, server) = serve_follow_up_http(host.clone()).await;
+    let client = reqwest::Client::new();
+    let receipt = follow_up_http_json(&client, &base, "POST", "/control/agents/synthetic-http-source/prompt", None,
+        Some(json!({"text":"Standalone managed timer follow-up evaluation", "expected_incarnation":incarnation,
+            "client_request_id":"synthetic-standalone-timer-160"}))).await;
+    let message = receipt["message_id"].as_str().unwrap();
+    let turn = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let located = follow_up_http_json(&client, &base, "POST", "/agents/synthetic-http-source/conversation/locate", Some(incarnation),
+                Some(json!({"source_ref":format!("message:{message}")}))).await;
+            if let Some(turns) = located["window"]["turns"].as_array() {
+                if let Some(turn) = turns.iter().find(|turn| turn["turn_id"] == located["target"]["turn_id"] && turn["execution"]["kind"] == "terminal" && turn["settled"] == true) {
+                    break turn.clone();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(turn["execution"]["outcome"], "completed");
+    assert_eq!(turn["result"]["kind"], "none");
+    assert_eq!(turn["result"]["reason"]["kind"], "structured_output_only");
+    assert!(turn["brief_ids"].as_array().unwrap().is_empty());
+    let state = host.agent_storage("synthetic-http-source").unwrap().read_agent().unwrap().unwrap();
+    assert!(state.current_execution_binding.is_none());
+    assert!(state.current_turn_id.is_none());
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    host.shutdown().await.unwrap();
+}

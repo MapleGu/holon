@@ -109,7 +109,7 @@ async fn restricted_agent_wire_auth_validation_and_atomic_failure() -> Result<()
         .await?;
     assert_eq!(
         caps,
-        json!({"toolAllowlist":true,"promptCancellation":true})
+        json!({"toolAllowlist":true,"promptCancellation":true,"structuredOutputOnly":true})
     );
     let create = format!("{base}/api/control/agents/custom-prefix/restricted/create");
     let mut custom = policy(34567);

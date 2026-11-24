@@ -2519,6 +2519,7 @@ pub enum TurnNoBriefReason {
     Aborted,
     Interrupted,
     ToolOnlyWait,
+    StructuredOutputOnly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

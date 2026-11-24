@@ -927,7 +927,8 @@ impl PreparedInputTransition {
         let expected = command.agent_state.as_ref()?.expected.as_deref()?;
         let record = match &command.mutation {
             QueueMutation::Upsert(record)
-            | QueueMutation::SettleWithProviderRecovery { record, .. }
+            | QueueMutation::SettleStructuredHttp { record, .. }
+                | QueueMutation::SettleWithProviderRecovery { record, .. }
             | QueueMutation::CompareAndSet { record, .. }
             | QueueMutation::ParkProviderDispatch { record, .. }
             | QueueMutation::ConsumeSettledTaskResultRecovery { record, .. } => record,

@@ -5611,7 +5611,10 @@ impl RuntimeHandle {
             (TurnTerminalKind::Completed, Some(TurnNoBriefReason::ReducerOnly { reason })) => {
                 !reason.trim().is_empty()
             }
-            (TurnTerminalKind::Completed, Some(TurnNoBriefReason::ToolOnlyWait)) => true,
+            (
+                TurnTerminalKind::Completed,
+                Some(TurnNoBriefReason::ToolOnlyWait | TurnNoBriefReason::StructuredOutputOnly),
+            ) => true,
             (TurnTerminalKind::Aborted, Some(TurnNoBriefReason::Aborted)) => true,
             (TurnTerminalKind::Interrupted, Some(TurnNoBriefReason::Interrupted)) => true,
             _ => false,
@@ -5940,6 +5943,24 @@ impl RuntimeHandle {
                     );
             }
         }
+        // Only explicit structured HTTP consumers own this completion contract.
+        // Recovery and cancellation keep their existing continuation/Stop owners.
+        let settle_structured_http_turn = if prepared_completion.is_none()
+            && prepared_wait.is_none()
+            && provider_pause.is_none()
+            && terminal_transition.is_some_and(|transition| {
+                matches!(transition.terminal.kind, TurnTerminalKind::Completed | TurnTerminalKind::BaselineOverBudget | TurnTerminalKind::ProviderFailedNeedsRecovery)
+                    && transition.provider_recovery_message.is_none()
+            })
+            && self.restricted_tool_allowlist().await?
+                .is_some_and(|policy| policy.structured_output_only())
+        {
+            self.inner.storage.read_message_by_id(&record.message_id)?
+                .is_some_and(|source| source.kind == MessageKind::OperatorPrompt
+                    && source.delivery_surface == Some(crate::types::MessageDeliverySurface::HttpControlPrompt))
+        } else {
+            false
+        };
         let original_audit_len = audit_events.len();
         let command = crate::runtime_db::transitions::QueueTransitionCommand {
             agent_id: record.agent_id.clone(),
@@ -6138,7 +6159,27 @@ impl RuntimeHandle {
                     {
                         state.current_run_id = None;
                     }
-                    state.current_turn_id = Some(transition.terminal.turn_id.clone());
+                    if settle_structured_http_turn {
+                        if !structured_turn_settlement::release_exact_turn(
+                            &guard.state,
+                            &mut state,
+                            &transition.turn_record,
+                            &record.message_id,
+                        ) {
+                            return Err(crate::domain::execution_protocol::ExecutionSettlementConflict::StaleStructuredTurn {
+                                turn_id: transition.terminal.turn_id.clone(),
+                                message_id: record.message_id.clone(),
+                            }.into());
+                        }
+                        let attempt_id = guard.state.current_execution_binding.as_ref()
+                            .and_then(|binding| binding.activation_id.clone())
+                            .context("structured HTTP turn has no canonical activation")?;
+                        command.mutation = crate::runtime_db::transitions::QueueMutation::SettleStructuredHttp {
+                            record: record.clone(), attempt_id, turn_id: transition.terminal.turn_id.clone(),
+                        };
+                    } else {
+                        state.current_turn_id = Some(transition.terminal.turn_id.clone());
+                    }
                     state.last_turn_terminal = Some(transition.terminal.clone());
                     Some(crate::runtime_db::transitions::AgentStateMutation {
                         expected: Some(Box::new(guard.committed_state().clone())),
@@ -8654,3 +8695,6 @@ mod dispatch_run_projection_tests;
 #[cfg(all(test, holon_lib_test_shard = "a"))]
 #[path = "runtime/conditional_work_item_tests.rs"]
 mod conditional_work_item_tests;
+
+#[path = "runtime/structured_turn_settlement.rs"]
+pub(crate) mod structured_turn_settlement;

@@ -1292,6 +1292,7 @@ impl RuntimeMutation {
         let entry = match &queue.command.mutation {
             QueueMutation::Consume(entry)
             | QueueMutation::Upsert(entry)
+            | QueueMutation::SettleStructuredHttp { record: entry, .. }
             | QueueMutation::SettleWithProviderRecovery { record: entry, .. }
             | QueueMutation::CompareAndSet { record: entry, .. }
             | QueueMutation::ParkProviderDispatch { record: entry, .. }

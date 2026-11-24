@@ -140,6 +140,7 @@ export interface RestrictedToolAllowlist {
   readonly tool_name_prefix: string;
   readonly tools: readonly RestrictedToolSpec[];
   readonly bridge: RestrictedToolBridge;
+  readonly structured_output_only?: true;
 }
 
 export const conditionalWorkItemCapabilitiesPath = "/control/runtime/conditional-work-item-capabilities";

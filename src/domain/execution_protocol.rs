@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExecutionSettlementConflict {
+    #[error("structured turn {turn_id} no longer owns source message {message_id}")]
+    StaleStructuredTurn { turn_id: String, message_id: String },
     #[error(
         "execution attempt {attempt_id} cannot settle message {message_id} as processed without a matching terminal Turn"
     )]
