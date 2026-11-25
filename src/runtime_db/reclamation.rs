@@ -225,7 +225,6 @@ fn terminal_execution_references_tx(tx: &Transaction<'_>, state: &AgentState) ->
     if turn.agent_id != state.id
         || turn.turn_id != turn_id
         || turn.turn_index != state.turn_index
-        || turn.current_work_item_id != state.current_turn_work_item_id
         || !turn.terminal.as_ref().is_some_and(|terminal| {
             state.last_turn_terminal.as_ref().is_some_and(|last| {
                 last.turn_id == turn_id
@@ -235,6 +234,36 @@ fn terminal_execution_references_tx(tx: &Transaction<'_>, state: &AgentState) ->
         })
     {
         return Ok(false);
+    }
+    if turn.current_work_item_id != state.current_turn_work_item_id {
+        // Closing Work releases the live focus before historical execution
+        // references are archived. Only a completed, same-agent native Work
+        // may explain a missing focus; all execution fences below still apply.
+        let Some(work_id) = turn.current_work_item_id.as_deref() else {
+            return Ok(false);
+        };
+        if state.current_turn_work_item_id.is_some() || state.current_execution_binding.is_none() {
+            return Ok(false);
+        }
+        let payload: Option<String> = tx.query_row(
+            "SELECT payload_json FROM work_items WHERE agent_id=?1 AND work_item_id=?2 AND state='completed'",
+            rusqlite::params![state.id, work_id],
+            |row| row.get(0),
+        ).optional()?;
+        let Some(payload) = payload else {
+            return Ok(false);
+        };
+        let work: crate::types::WorkItemRecord = serde_json::from_str(&payload)?;
+        if work.id != work_id
+            || work.agent_id != state.id
+            || work.state != crate::types::WorkItemState::Completed
+            || turn.owner
+                != Some(TurnOwner::WorkItem {
+                    work_item_id: work_id.into(),
+                })
+        {
+            return Ok(false);
+        }
     }
     let Some(binding) = &state.current_execution_binding else {
         return Ok(true);
@@ -685,6 +714,200 @@ mod tests {
         assert_eq!(retired.incarnation, identity.incarnation);
         assert_eq!(retired.status, AgentRegistryStatus::Deleting);
         assert!(job.archive_path.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn completed_work_released_focus_requires_exact_native_terminal_evidence() -> Result<()> {
+        use crate::types::{TurnRecord, TurnTerminalSummary, WorkItemExecutionBinding};
+        let blocked = Some("unverified_execution_references".into());
+        for variant in [
+            "exact",
+            "open",
+            "completing",
+            "missing-work",
+            "wrong-work-agent",
+            "wrong-work-id",
+            "wrong-work-state",
+            "other-focus",
+            "missing-binding",
+            "wrong-binding-work",
+            "wrong-owner",
+            "wrong-source",
+            "wrong-attempt",
+            "wrong-turn",
+            "wrong-index",
+            "live-turn",
+            "wrong-terminal",
+            "missing-outcome",
+            "wrong-outcome",
+            "wrong-outcome-binding",
+            "open-attempt",
+            "wrong-attempt-turn",
+            "wrong-attempt-run",
+            "live-run",
+            "live-status",
+        ] {
+            let (_dir, db) = open_db();
+            let agent = "synthetic-completed-work";
+            let mut state = settled(agent, AgentStatus::Asleep, TurnTerminalKind::Completed);
+            state.turn_index = 1;
+            state.current_turn_id = Some("turn-1".into());
+            let owner = TurnOwner::WorkItem {
+                work_item_id: "work".into(),
+            };
+            state.current_execution_binding = Some(WorkItemExecutionBinding {
+                activation_id: Some("attempt".into()),
+                admission_provenance: None,
+                source_message_id: "source".into(),
+                turn_id: "turn-1".into(),
+                owner: Some(owner.clone()),
+                work_item_id: Some("work".into()),
+                claimed_work_revision: Some(3),
+            });
+            let mut turn = TurnRecord::new(agent, "turn-1", 1);
+            turn.owner = Some(owner);
+            turn.run_id = Some("run".into());
+            turn.current_work_item_id = Some("work".into());
+            turn.input_message_ids = vec!["source".into()];
+            let message = crate::types::MessageEnvelope::new(
+                agent,
+                crate::types::MessageKind::InternalFollowup,
+                crate::types::MessageOrigin::System {
+                    subsystem: "synthetic".into(),
+                },
+                crate::types::AuthorityClass::RuntimeInstruction,
+                crate::types::Priority::Next,
+                crate::types::MessageBody::Text {
+                    text: "synthetic".into(),
+                },
+            );
+            let mut trigger = crate::types::TurnTriggerSummary::from_message(&message);
+            trigger.message_id = Some("source".into());
+            turn.trigger = Some(trigger);
+            turn.terminal = Some(TurnTerminalSummary::from_terminal(&terminal_record(
+                TurnTerminalKind::Completed,
+            )));
+            let mut work = WorkItemRecord::new(agent, "synthetic", WorkItemState::Completed);
+            work.id = "work".into();
+            work.revision = 4;
+            if variant == "open" {
+                work.state = WorkItemState::Open;
+            }
+            if variant == "completing" {
+                work.state = WorkItemState::Completing;
+            }
+            if variant == "wrong-work-agent" {
+                work.agent_id = "other".into();
+            }
+            if variant == "wrong-work-id" {
+                work.id = "other".into();
+            }
+            if variant == "wrong-work-state" {
+                work.state = WorkItemState::Open;
+            }
+            if variant == "other-focus" {
+                state.current_turn_work_item_id = Some("other".into());
+            }
+            if variant == "missing-binding" {
+                state.current_execution_binding = None;
+            }
+            if variant == "wrong-binding-work" {
+                state
+                    .current_execution_binding
+                    .as_mut()
+                    .unwrap()
+                    .work_item_id = Some("other".into());
+            }
+            if variant == "wrong-owner" {
+                state.current_execution_binding.as_mut().unwrap().owner = Some(TurnOwner::Command);
+            }
+            if variant == "wrong-source" {
+                state
+                    .current_execution_binding
+                    .as_mut()
+                    .unwrap()
+                    .source_message_id = "other".into();
+            }
+            if variant == "wrong-attempt" {
+                state
+                    .current_execution_binding
+                    .as_mut()
+                    .unwrap()
+                    .activation_id = Some("other".into());
+            }
+            if variant == "wrong-turn" {
+                state.current_execution_binding.as_mut().unwrap().turn_id = "other".into();
+            }
+            if variant == "wrong-index" {
+                state.turn_index = 2;
+            }
+            if variant == "live-turn" {
+                turn.terminal = None;
+            }
+            if variant == "wrong-terminal" {
+                state.last_turn_terminal.as_mut().unwrap().kind = TurnTerminalKind::Interrupted;
+            }
+            if variant == "live-run" {
+                state.current_run_id = Some("run".into());
+            }
+            if variant == "live-status" {
+                state.status = AgentStatus::AwakeRunning;
+            }
+            let mut attempt = serde_json::json!({
+                "agent_id":agent,"attempt_id":"attempt","source_message_id":"source",
+                "source":{"identity":{"kind":"work_item_continuation","work_item_id":"work"},"generation":4},
+                "binding":{"kind":"work_item","work_item_id":"work"},
+                "provenance":{"origin":"runtime_recovery","trust":"runtime_instruction","priority":"next"},
+                "admitted_fences":{"source_revision":4,"agent_control_revision":1,"host_registry_revision":1},
+                "state":"settled","turn_id":"turn-1","terminal_outcome_id":"outcome",
+                "admitted_at":"2040-01-01T00:00:00Z","terminal_at":"2040-01-01T00:00:01Z"
+            });
+            let mut outcome = serde_json::json!({
+                "outcome_id":"outcome","attempt_id":"attempt",
+                "outcome":{"owner":"work_item","outcome":{"kind":"complete","completion":"synthetic"}},
+                "created_at":"2040-01-01T00:00:01Z"
+            });
+            if variant == "open-attempt" {
+                attempt["state"] = "open".into();
+            }
+            if variant == "wrong-attempt-turn" {
+                attempt["turn_id"] = "other".into();
+            }
+            if variant == "wrong-attempt-run" {
+                attempt["run_id"] = "other".into();
+            }
+            if variant == "wrong-outcome" {
+                outcome["attempt_id"] = "other".into();
+            }
+            if variant == "wrong-outcome-binding" {
+                outcome["outcome"] =
+                    serde_json::json!({"owner":"conversation","outcome":{"kind":"replied"}});
+            }
+            db.turn_records().upsert(&turn)?;
+            db.transaction(|tx| {
+                if variant != "missing-work" {
+                    tx.execute("INSERT INTO work_items(work_item_id,agent_id,state,objective,revision,created_at,updated_at,payload_json) VALUES('work',?1,?2,'synthetic',4,?3,?3,?4)",
+                        rusqlite::params![agent, if variant == "open" { "open" } else if variant == "completing" { "completing" } else { "completed" }, Utc::now().to_rfc3339(), serde_json::to_string(&work)?])?;
+                }
+                tx.execute("INSERT INTO execution_protocol_attempts VALUES(?1,'attempt',?2,'{}',4,NULL,'outcome',?3)",
+                    rusqlite::params![agent, if variant == "open-attempt" { "open" } else { "settled" }, attempt.to_string()])?;
+                if variant != "missing-outcome" {
+                    tx.execute("INSERT INTO execution_protocol_outcomes VALUES(?1,'outcome','attempt',?2)", rusqlite::params![agent, outcome.to_string()])?;
+                }
+                Ok(())
+            })?;
+            let before = state.clone();
+            let result = db.transaction(|tx| conditional_delete_blocker_tx(tx, &state))?;
+            let expected = match variant {
+                "exact" => None,
+                "open-attempt" => Some("open_execution".into()),
+                "live-run" | "live-status" => Some("runtime_execution_or_wake".into()),
+                _ => blocked.clone(),
+            };
+            assert_eq!(result, expected, "{variant}");
+            assert_eq!(state, before, "admission must not mutate state: {variant}");
+        }
         Ok(())
     }
 
