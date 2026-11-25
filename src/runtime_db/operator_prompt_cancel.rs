@@ -21,6 +21,12 @@ CREATE TABLE operator_prompt_cancellations (
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum CancelStatus {
+    AbortRequested {
+        #[serde(rename = "messageId")]
+        message_id: String,
+        #[serde(rename = "runId")]
+        run_id: String,
+    },
     Cancelled {
         #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,

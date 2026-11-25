@@ -11790,6 +11790,18 @@ fn settle_released_http_turn_tx(
         .terminal
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("released HTTP turn is not terminal"))?;
+    if terminal.kind == TurnTerminalKind::Aborted
+        && terminal.reason.as_deref() == Some(crate::runtime::claimed_prompt_abort::CLAIMED_PROMPT_ABORT)
+    {
+        anyhow::ensure!(terminal.no_brief_reason == Some(crate::types::TurnNoBriefReason::Aborted)
+            && turn.current_work_item_id.is_none() && original.current_work_item_id.is_none()
+            && turn.produced_brief_ids.is_empty() && record.status == QueueEntryStatus::Aborted
+            && turn.input_message_ids.as_slice() == [source]
+            && turn.idle_input_batch.is_none() && turn.live_input_batches.is_empty(),
+            "claimed prompt abort cannot complete output or durable Work");
+        super::conversation::settle_turn_result_tx(tx, &turn.agent_id, &turn.turn_id, terminal.completed_at)?;
+        return Ok(());
+    }
     if terminal.no_brief_reason == Some(crate::types::TurnNoBriefReason::StructuredOutputOnly) {
         anyhow::ensure!(
             matches!(terminal.kind, TurnTerminalKind::Completed | TurnTerminalKind::ProviderFailed)

@@ -196,7 +196,7 @@ impl ToolRegistry {
         }
         let tool_started = std::time::Instant::now();
         let (result, input_coercion) = if let Some(policy) = restricted {
-            let mut result = policy.call(call).await?;
+            let mut result = policy.call(runtime, call).await?;
             if matches!(result.loop_directive, Some(super::spec::ToolLoopDirective::CompleteStructuredOutput))
                 && !runtime.is_standalone_structured_turn(
                     context.message_id.as_deref(), context.turn_id.as_deref(),

@@ -1,4 +1,4 @@
-//! Authenticated exact request cancellation; never stops an Agent or a Turn.
+//! Authenticated request cancellation and opt-in exact structured run abort.
 use super::*;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6,6 +6,19 @@ pub struct CancelRequest {
     client_request_id: String,
     #[serde(default)]
     complete_structured_output: bool,
+    #[serde(default, deserialize_with = "claimed_abort_request")]
+    abort_claimed: Option<ClaimedPromptAbort>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimedPromptAbort {
+    message_id: String,
+    run_id: String,
+}
+fn claimed_abort_request<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ClaimedPromptAbort>, D::Error> {
+    ClaimedPromptAbort::deserialize(deserializer).map(Some)
 }
 pub async fn cancel(
     Path(agent): Path<String>,
@@ -14,6 +27,12 @@ pub async fn cancel(
     ApiJson(input): ApiJson<CancelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     authorize_control(&headers, &state).map_err(authentication_error_response)?;
+    if input.complete_structured_output && input.abort_claimed.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"completion and abort are mutually exclusive"})),
+        ));
+    }
     let principal = control_actor(&headers, &state)
         .map_err(authentication_error_response)?
         .principal_id();
@@ -30,7 +49,17 @@ pub async fn cancel(
         .get_operator_agent(&agent)
         .await
         .map_err(agent_access_error)?;
-    let outcome = if input.complete_structured_output {
+    let outcome = if let Some(abort) = input.abort_claimed {
+        runtime
+            .abort_claimed_structured_prompt(
+                incarnation,
+                principal,
+                &input.client_request_id,
+                &abort.message_id,
+                &abort.run_id,
+            )
+            .await
+    } else if input.complete_structured_output {
         runtime
             .complete_claimed_structured_prompt(incarnation, principal, &input.client_request_id)
             .await

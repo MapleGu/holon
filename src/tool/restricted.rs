@@ -191,7 +191,10 @@ impl ToolAllowlist {
         );
         Ok(())
     }
-    pub(crate) async fn call(&self, call: &ToolCall) -> Result<ToolResult> {
+    pub(crate) async fn call(&self, runtime: &crate::runtime::RuntimeHandle, call: &ToolCall) -> Result<ToolResult> {
+        self.call_inner(Some(runtime), call).await
+    }
+    async fn call_inner(&self, runtime: Option<&crate::runtime::RuntimeHandle>, call: &ToolCall) -> Result<ToolResult> {
         self.check(&call.name)?;
         let send = async {
             ensure!(call.input.is_object(), "args");
@@ -208,13 +211,17 @@ impl ToolAllowlist {
                 .connect_timeout(std::time::Duration::from_secs(2))
                 .timeout(std::time::Duration::from_secs(10))
                 .build()?;
-            let mut response = client
+            let request = client
                 .post(&self.bridge.url)
                 .bearer_auth(&self.bridge.bearer)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body)
-                .send()
-                .await?;
+                .build()?;
+            // Validate/encode locally before acquiring uncertain output ownership.
+            let fence = if let Some(runtime) = runtime {
+                runtime.fence_claimed_abort_for_tool(&call.name).await?
+            } else { None };
+            let mut response = client.execute(request).await?;
             ensure!(response.status().is_success(), "status");
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await? {
@@ -234,6 +241,16 @@ impl ToolAllowlist {
                 reply.get("ok") == Some(&Value::Bool(true)) && reply.get("result").is_some(),
                 "reply"
             );
+            // Only this authenticated send's explicit rejection releases
+            // its own fence. Acceptance, malformed/unknown results and older sends stay fenced.
+            let rejected = reply["result"].get("accepted") == Some(&Value::Bool(false))
+                && matches!(reply["result"].get("retryable"), Some(Value::Bool(_)))
+                && matches!(reply.get("complete_turn"), None | Some(Value::Bool(false)));
+            if rejected {
+                if let (Some(runtime), Some(fence)) = (runtime, fence.as_ref()) {
+                    runtime.release_claimed_abort_after_rejection(fence).await?;
+                }
+            }
             let mut result = ToolResult::success(&call.name, reply["result"].clone(), None);
             // The authenticated bridge's outer receipt is separate from tool input and output.
             if self.completion_tool() == Some(call.name.as_str())
@@ -246,6 +263,7 @@ impl ToolAllowlist {
         // Never return provider bodies, transport errors, URL, or credentials.
         Ok(match send.await {
             Ok(result) => result,
+            Err(error) if error.is::<crate::runtime::CurrentRunAborted>() => return Err(error),
             Err(_) => ToolResult::error(
                 &call.name,
                 super::ToolError::new("service_bridge_failed", "Service bridge call failed"),
@@ -606,7 +624,7 @@ mod tests {
                 json!({"tool_name_prefix":"fixture_","tools":[{"name":"fixture_test","description":"test","parameters":{"type":"object"}}],"bridge":{"url":format!("http://127.0.0.1:{port}/call"),"bearer":"synthetic-ephemeral-0007"}}),
             )?;
             let result = policy
-                .call(&ToolCall {
+                .call_inner(None, &ToolCall {
                     id: "test".into(),
                     name: "fixture_test".into(),
                     input: json!({}),

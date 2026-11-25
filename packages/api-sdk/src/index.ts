@@ -152,4 +152,6 @@ export const conditionalWorkItemCapabilitiesPath = "/control/runtime/conditional
 export interface RestrictedPromptCancellation {
   readonly client_request_id: string;
   readonly complete_structured_output?: true;
+  /** Mutually exclusive with complete_structured_output. Receipt is not terminal proof. */
+  readonly abort_claimed?: Readonly<{ message_id: string; run_id: string }>;
 }

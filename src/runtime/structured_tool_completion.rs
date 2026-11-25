@@ -7,7 +7,7 @@ use anyhow::ensure;
 pub(super) const ACCEPTED_OUTPUT_ABORT: &str = "structured_output_accepted";
 
 impl RuntimeHandle {
-    fn has_standalone_structured_binding(
+    pub(super) fn has_standalone_structured_binding(
         &self,
         state: &AgentState,
         message_id: &str,
@@ -70,7 +70,7 @@ impl RuntimeHandle {
             &state.id,
             self.inner.identity_incarnation,
         )?
-        .is_some_and(|policy| policy.completion_tool().is_some())
+        .is_some_and(|policy| policy.structured_output_only())
         {
             return Ok(false);
         }

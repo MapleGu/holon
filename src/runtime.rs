@@ -5947,13 +5947,16 @@ impl RuntimeHandle {
             }
         }
         // Only explicit structured HTTP consumers own this completion contract.
-        // Recovery and cancellation keep their existing continuation/Stop owners.
+        // Ordinary recovery/cancellation retain their continuation/Stop owners.
         let settle_structured_http_turn = if prepared_completion.is_none()
             && prepared_wait.is_none()
             && provider_pause.is_none()
             && terminal_transition.is_some_and(|transition| {
                 matches!(transition.terminal.kind, TurnTerminalKind::Completed | TurnTerminalKind::BaselineOverBudget | TurnTerminalKind::ProviderFailedNeedsRecovery | TurnTerminalKind::ProviderFailed)
                     && transition.provider_recovery_message.is_none()
+                    || (transition.terminal.kind == TurnTerminalKind::Aborted
+                        && transition.terminal.reason.as_deref() == Some(claimed_prompt_abort::CLAIMED_PROMPT_ABORT)
+                        && transition.provider_recovery_message.is_none())
             })
             && self.restricted_tool_allowlist().await?
                 .is_some_and(|policy| policy.structured_output_only())
@@ -7219,14 +7222,16 @@ impl RuntimeHandle {
                     aborted.as_ref()
                 {
                     (
-                        self.build_turn_interrupted_record(
-                            &aborted.reason,
-                            None,
-                            u64::try_from(processing_started.elapsed().as_millis())
-                                .unwrap_or(u64::MAX),
-                        )
-                        .await,
-                        QueueEntryStatus::Interrupted,
+                        if aborted.reason == claimed_prompt_abort::CLAIMED_PROMPT_ABORT {
+                            self.build_turn_aborted_record(&aborted.reason, None,
+                                u64::try_from(processing_started.elapsed().as_millis()).unwrap_or(u64::MAX)).await
+                        } else {
+                            self.build_turn_interrupted_record(&aborted.reason, None,
+                                u64::try_from(processing_started.elapsed().as_millis()).unwrap_or(u64::MAX)).await
+                        },
+                        if aborted.reason == claimed_prompt_abort::CLAIMED_PROMPT_ABORT {
+                            QueueEntryStatus::Aborted
+                        } else { QueueEntryStatus::Interrupted },
                         vec![AuditEvent::legacy(
                             "message_processing_aborted",
                             serde_json::json!({
@@ -8702,3 +8707,5 @@ mod conditional_work_item_tests;
 #[path = "runtime/structured_turn_settlement.rs"]
 pub(crate) mod structured_turn_settlement;
 mod structured_tool_completion;
+
+pub(crate) mod claimed_prompt_abort;
